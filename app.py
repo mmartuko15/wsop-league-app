@@ -25,38 +25,78 @@ def pools_balance(pools_df, pool):
     return float((d["Amount"]*sign).sum())
 
 def build_leaderboard(sheet_map: dict) -> pd.DataFrame:
+    """
+    Robust leaderboard:
+    - Accepts various column labels for Player/Place/KOs
+    - Skips malformed event sheets instead of raising KeyError
+    """
+    import re
+
+    def norm_cols(df):
+        # lowercase, remove non-alnum for easy matching
+        mapping = {}
+        for c in df.columns:
+            key = re.sub(r'[^a-z0-9]', '', str(c).lower())
+            mapping[c] = key
+        return df.rename(columns=mapping), set(mapping.values()), mapping
+
+    def pick(colset, *candidates):
+        # first candidate that exists
+        for cand in candidates:
+            if cand in colset:
+                return cand
+        return None
+
     frames = []
-    for name, df in sheet_map.items():
-        if not (name.startswith("Event_") and name.endswith("_Standings")):
+    for name, df in (sheet_map or {}).items():
+        if not isinstance(df, pd.DataFrame):
             continue
-        # Normalize column names
-        cols = {c.strip(): c for c in df.columns if isinstance(c, str)}
-        if "Player" not in cols or "Place" not in cols:
+        nm = str(name).lower()
+        if not (nm.startswith("event_") and nm.endswith("_standings")):
             continue
-        # KO column can be '#Eliminated' or 'KOs'
-        ko_col = None
-        for candidate in ["#Eliminated","KOs","Kos","KOs "]:
-            if candidate in cols:
-                ko_col = cols[candidate]
-                break
-        if ko_col is None:
-            # If no KO column, assume zeros
-            t = df[[cols["Player"], cols["Place"]]].copy()
-            t["KOs"] = 0
+        if df.empty:
+            continue
+
+        df2, colset, mapping = norm_cols(df)
+
+        # Flexible header aliases
+        player_key = pick(colset, "player", "name")
+        place_key  = pick(colset, "place", "rank", "finish", "position")
+        kos_key    = pick(colset, "kos", "ko", "knockouts", "knockout", "eliminations", "elimination", "eliminated", "eliminatedby", "elims", "numeliminated", "eliminatedcount", "eliminated_")
+
+        if not player_key or not place_key:
+            # Skip this sheet; it's missing essentials
+            continue
+
+        t = pd.DataFrame()
+        t["Player"] = df2[player_key].astype(str).str.strip()
+        t["Place"] = pd.to_numeric(df2[place_key], errors="coerce")
+
+        if kos_key and kos_key in df2.columns:
+            t["KOs"] = pd.to_numeric(df2[kos_key], errors="coerce").fillna(0).astype(int)
         else:
-            t = df[[cols["Player"], cols["Place"], ko_col]].copy().rename(columns={ko_col:"KOs"})
-        t.rename(columns={cols["Player"]:"Player", cols["Place"]:"Place"}, inplace=True)
+            t["KOs"] = 0
+
+        t = t.dropna(subset=["Place"])
+        # POINTS must be defined above
         t["Points"] = t["Place"].map(POINTS).fillna(0)
         frames.append(t)
+
     if not frames:
         return pd.DataFrame(columns=["Player","Total Points","Total KOs","Events Played"])
+
     all_ev = pd.concat(frames, ignore_index=True)
-    g = all_ev.groupby("Player", as_index=False).agg(
-        **{"Total Points":("Points","sum"), "Total KOs":("KOs","sum"), "Events Played":("Points","count")}
+    g = (
+        all_ev.groupby("Player", as_index=False)
+        .agg(Total_Points=("Points","sum"),
+             Total_KOs=("KOs","sum"),
+             Events_Played=("Points","count"))
+        .sort_values(["Total_Points","Total_KOs"], ascending=[False,False])
+        .reset_index(drop=True)
     )
-    g = g.sort_values(["Total Points","Total KOs"], ascending=[False,False]).reset_index(drop=True)
     g.index = g.index + 1
     return g
+
 
 st.set_page_config(page_title="WSOP League — Admin", page_icon="🛠️", layout="wide")
 
