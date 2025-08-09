@@ -24,39 +24,18 @@ def pools_balance(pools_df, pool):
     sign = d["Type"].map({"Accrual":1,"Payout":-1}).fillna(1)
     return float((d["Amount"]*sign).sum())
 
-def build_leaderboard(sheet_map: dict) -> pd.DataFrame:
-    frames = []
-    for name, df in sheet_map.items():
-        if not (name.startswith("Event_") and name.endswith("_Standings")):
-            continue
-        # Normalize column names
-        cols = {c.strip(): c for c in df.columns if isinstance(c, str)}
-        if "Player" not in cols or "Place" not in cols:
-            continue
-        # KO column can be '#Eliminated' or 'KOs'
-        ko_col = None
-        for candidate in ["#Eliminated","KOs","Kos","KOs "]:
-            if candidate in cols:
-                ko_col = cols[candidate]
-                break
-        if ko_col is None:
-            # If no KO column, assume zeros
-            t = df[[cols["Player"], cols["Place"]]].copy()
-            t["KOs"] = 0
-        else:
-            t = df[[cols["Player"], cols["Place"], ko_col]].copy().rename(columns={ko_col:"KOs"})
-        t.rename(columns={cols["Player"]:"Player", cols["Place"]:"Place"}, inplace=True)
-        t["Points"] = t["Place"].map(POINTS).fillna(0)
-        frames.append(t)
-    if not frames:
-        return pd.DataFrame(columns=["Player","Total Points","Total KOs","Events Played"])
-    all_ev = pd.concat(frames, ignore_index=True)
-    g = all_ev.groupby("Player", as_index=False).agg(
-        **{"Total Points":("Points","sum"), "Total KOs":("KOs","sum"), "Events Played":("Points","count")}
-    )
-    g = g.sort_values(["Total Points","Total KOs"], ascending=[False,False]).reset_index(drop=True)
-    g.index = g.index + 1
-    return g
+def get_col(df, candidates):
+    cols = {re.sub(r'[^a-z0-9]', '', c.lower()): c for c in df.columns}
+    for cand in candidates:
+        key = re.sub(r'[^a-z0-9]', '', cand.lower())
+        if key in cols:
+            return cols[key]
+    return None
+
+# Usage per event sheet:
+pcol = get_col(df, ["Player","Name"])
+kcol = get_col(df, ["KOs","#Eliminated","Knockouts","Eliminations"])
+
 
 st.set_page_config(page_title="WSOP League — Player Home", page_icon="🃏", layout="wide")
 
