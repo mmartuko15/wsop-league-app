@@ -53,20 +53,78 @@ def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_by
     r = requests.put(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
 
+def build_financial_summary(roster_df, event_sheets, series_buyins_df):
+    frames = []
+    for df in event_sheets:
+        if df is None or df.empty: 
+            continue
+        tmp = df.copy()
+        if "Payout_Amount" not in tmp.columns and "Payout" in tmp.columns:
+            def pm(x):
+                if pd.isna(x): return 0.0
+                if isinstance(x,(int,float)): return float(x)
+                s = str(x).replace("$","").replace(",","").strip()
+                try: return float(s)
+                except: return 0.0
+            tmp["Payout_Amount"] = tmp["Payout"].map(pm)
+        if "Bounty $ (KOs*5)" not in tmp.columns and "KOs" in tmp.columns:
+            tmp["Bounty $ (KOs*5)"] = tmp["KOs"]*5
+        frames.append(tmp[["Player","Payout_Amount","Bounty $ (KOs*5)"]])
+    all_rows = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Player","Payout_Amount","Bounty $ (KOs*5)"])
+
+    events_played = all_rows.groupby("Player").size().rename("Events Played").to_frame()
+    nightly_earned = all_rows.groupby("Player")["Payout_Amount"].sum().rename("Nightly Payouts Earned").to_frame()
+    bounties_earned = all_rows.groupby("Player")["Bounty $ (KOs*5)"].sum().rename("Bounties Earned").to_frame()
+
+    if series_buyins_df is not None and not series_buyins_df.empty:
+        initial_buyins_paid = series_buyins_df.groupby("Player")["Amount"].sum().rename("Initial Buy-Ins Paid").to_frame()
+    else:
+        initial_buyins_paid = pd.DataFrame(columns=["Initial Buy-Ins Paid"])
+
+    nightly_fees = (events_played["Events Played"] * 55).rename("Nightly Fees Paid").to_frame()
+    bounty_contrib = (events_played["Events Played"] * 5).rename("Bounty Contributions Paid").to_frame()
+
+    base = roster_df[["Player"]].copy()
+    out = base.merge(events_played, left_on="Player", right_index=True, how="left")
+    out = out.merge(nightly_earned, left_on="Player", right_index=True, how="left")
+    out = out.merge(bounties_earned, left_on="Player", right_index=True, how="left")
+    out = out.merge(nightly_fees, left_on="Player", right_index=True, how="left")
+    out = out.merge(bounty_contrib, left_on="Player", right_index=True, how="left")
+    out = out.merge(initial_buyins_paid, left_on="Player", right_index=True, how="left")
+
+    out["Events Played"] = out["Events Played"].fillna(0).astype(int)
+    for col in ["Nightly Payouts Earned","Bounties Earned","Nightly Fees Paid","Bounty Contributions Paid","Initial Buy-Ins Paid"]:
+        if col in out.columns:
+            out[col] = out[col].fillna(0.0)
+        else:
+            out[col] = 0.0
+
+    out["Total Paid In"] = out["Initial Buy-Ins Paid"] + out["Nightly Fees Paid"]
+    out["Total Earned"] = out["Nightly Payouts Earned"] + out["Bounties Earned"]
+    out["Net Winnings"] = out["Total Earned"] - out["Total Paid In"]
+
+    cols = [
+        "Player","Events Played",
+        "Initial Buy-Ins Paid","Nightly Fees Paid","Bounty Contributions Paid",
+        "Nightly Payouts Earned","Bounties Earned",
+        "Total Paid In","Total Earned","Net Winnings"
+    ]
+    for c in cols:
+        if c not in out.columns:
+            out[c] = 0.0
+    return out[cols].sort_values(["Net Winnings","Total Earned"], ascending=[False,False]).reset_index(drop=True)
+
 
 st.set_page_config(page_title="WSOP League — Admin", page_icon="🛠️", layout="wide")
 
-# Header
 col_logo, col_title = st.columns([1,4])
 with col_logo:
     st.image("league_logo.png", use_column_width=True)
 with col_title:
     st.markdown("### Mark & Rose's WSOP League — Admin")
-    st.caption("Upload tracker, ingest events, manage Second Chance opt-ins, and High Hand info.")
-
+    st.caption("Upload tracker, ingest events, manage Second Chance opt-ins, High Hand, and Series Buy-Ins.")
 st.divider()
 
-# Sidebar: data source
 st.sidebar.header("Data Source")
 default_map, default_bytes = read_local_tracker()
 uploaded_tracker = st.sidebar.file_uploader("Upload Tracker (.xlsx)", type=["xlsx"], key="tracker_admin")
@@ -82,7 +140,6 @@ else:
     st.info("Upload your tracker .xlsx in the sidebar or add tracker.xlsx to the repo root.")
     st.stop()
 
-# Sidebar: GitHub publish settings
 st.sidebar.header("Publish to Player Home")
 owner_repo = st.sidebar.text_input("GitHub repo (owner/repo)", value="youruser/wsop-league-app")
 branch = st.sidebar.text_input("Branch", value="main")
@@ -90,7 +147,6 @@ gh_token = st.secrets.get("GITHUB_TOKEN", "")
 if not gh_token:
     gh_token = st.sidebar.text_input("GitHub token (repo scope)", type="password")
 
-# KPIs
 pools = sheet_map.get("Pools_Ledger", pd.DataFrame())
 wsop_total = pools_balance(pools,"WSOP")
 bounty_total = pools_balance(pools,"Bounty")
@@ -104,7 +160,6 @@ k3.metric("Bounty Pool (live)", f"${bounty_total:,.2f}")
 k4.metric("High Hand (live)", f"${highhand_total:,.2f}")
 k5.metric("Nightly Pool (post-payout)", f"${nightly_total:,.2f}")
 
-# Build leaderboard (works with one event)
 def build_leaderboard(sheet_map: dict) -> pd.DataFrame:
     frames = []
     for name, df in sheet_map.items():
@@ -126,9 +181,8 @@ def build_leaderboard(sheet_map: dict) -> pd.DataFrame:
     g.rename(columns={"Total_Points":"Total Points","Total_KOs":"Total KOs","Events_Played":"Events Played"}, inplace=True)
     return g
 
-tabs = st.tabs(["Leaderboard","Events","Add New Event from Timer Log","Opt-Ins (Admin)","High Hand (Admin)","Pools Ledger","Supplies","Download/Publish"])
+tabs = st.tabs(["Leaderboard","Events","Add New Event from Timer Log","Opt-Ins (Admin)","High Hand (Admin)","Buy-Ins (Admin)","Player Finances","Pools Ledger","Supplies","Download/Publish"])
 
-# Leaderboard
 with tabs[0]:
     lb = build_leaderboard(sheet_map)
     if lb.empty:
@@ -136,17 +190,14 @@ with tabs[0]:
     else:
         st.dataframe(lb, use_container_width=True)
 
-# Events
 with tabs[1]:
     st.dataframe(sheet_map.get("Events", pd.DataFrame()), use_container_width=True)
 
-# Add New Event from Timer Log
 with tabs[2]:
     st.subheader("Upload the timer's event log (HTML/CSV export)")
     new_log = st.file_uploader("Timer Log Export", type=["html","csv","txt"], key="newlog_admin")
     if new_log is not None:
         try:
-            # Parse
             raw = new_log.read()
             try:
                 html = base64.b64decode(raw).decode("utf-8","ignore")
@@ -164,30 +215,25 @@ with tabs[2]:
             win_idx = standings.index[standings["Place"]==1]
             if len(win_idx):
                 standings.loc[win_idx[0],"Bounty $ (KOs*5)"] += 5
-
             standings["Payout_Amount"] = standings["Payout"].apply(parse_money)
 
-            # Determine next event #
             ev_nums = [int(n.split("_")[1]) for n in sheet_map.keys() if n.startswith("Event_") and n.endswith("_Standings")]
             ev_next = (max(ev_nums)+1) if ev_nums else 1
 
             events = sheet_map.get("Events", pd.DataFrame())
             e_date = str(events[events["Event #"]==ev_next]["Date"].iloc[0]) if not events.empty and not events[events["Event #"]==ev_next].empty else "2025-01-01"
 
-            # Players list from BuyIn row
             buyin_row = rp.iloc[0]
             players_list = [p.strip() for p in str(buyin_row.get("Players","")).split(",") if p.strip()]
             n_players = len(players_list)
 
-            # Auto-add new players to Players sheet
-            players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player","Initial Buy-In Paid","Active"])).copy()
+            players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player","Active","Notes"])).copy()
             existing = set(players_sheet["Player"]) if not players_sheet.empty else set()
             for p in players_list:
                 if p not in existing:
-                    players_sheet.loc[len(players_sheet)] = [p, 200.0, True]
+                    players_sheet.loc[len(players_sheet)] = [p, True, "Auto-added from event log"]
             sheet_map["Players"] = players_sheet
 
-            # Pools ledger
             pools = sheet_map.get("Pools_Ledger", pd.DataFrame(columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])).copy()
             def add_ledger(date, ev, typ, pool, amount, immediate, note):
                 nonlocal pools
@@ -201,20 +247,17 @@ with tabs[2]:
             add_ledger(e_date, ev_next, "Payout", "Nightly", float(standings["Payout_Amount"].sum()), "Yes", "Paid out on event night based on finish order")
             sheet_map["Pools_Ledger"] = pools
 
-            # Supplies: ensure $100 tip for this event
             supplies = sheet_map.get("Supplies", pd.DataFrame(columns=["Event #","Date","Item","Amount","Notes"])).copy()
             if not supplies[(supplies["Event #"]==ev_next) & (supplies["Item"]=="Server Tip")].any().any():
                 supplies.loc[len(supplies)] = [ev_next, e_date, "Server Tip", 100.00, "Auto-added"]
             sheet_map["Supplies"] = supplies
 
-            # Save standings
             sheet_map[f"Event_{ev_next}_Standings"] = standings
 
             st.success(f"Ingested event #{ev_next}. Use 'Download/Publish' tab to export.")
         except Exception as e:
             st.error(f"Could not add event: {e}")
 
-# Opt-Ins (Admin)
 with tabs[3]:
     st.subheader("Second Chance Opt-Ins (Events 8–12)")
     players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
@@ -231,7 +274,6 @@ with tabs[3]:
         sheet_map["SecondChance_OptIns"] = current_optins.sort_values(["Event #","Player"]).reset_index(drop=True)
         st.success("Saved opt-ins.")
 
-# High Hand (Admin)
 with tabs[4]:
     st.subheader("High Hand Controls")
     hh = sheet_map.get("HighHand_Info", pd.DataFrame(columns=["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"])).copy()
@@ -250,16 +292,51 @@ with tabs[4]:
         sheet_map["HighHand_Info"] = hh
         st.success("High Hand info saved.")
 
-# Pools Ledger
 with tabs[5]:
+    st.subheader("Series Buy-Ins ($200) — Ledger")
+    sb = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount","Date","Method","Note"])).copy()
+    st.dataframe(sb, use_container_width=True)
+    st.markdown("---")
+    st.write("**Add a payment**")
+    players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
+    player_sel = st.selectbox("Player", sorted(players_sheet["Player"].dropna().unique().tolist()) if not players_sheet.empty else [])
+    amount = st.number_input("Amount", value=200.0, step=50.0)
+    date = st.date_input("Date")
+    method = st.selectbox("Method", ["Cash","Zelle","Venmo","Check","Other"])
+    note = st.text_input("Note", value="")
+    if st.button("Add Payment"):
+        sb.loc[len(sb)] = [player_sel, float(amount), str(date), method, note]
+        sheet_map["Series_BuyIns"] = sb
+        st.success("Payment added.")
+
+with tabs[6]:
+    st.subheader("Per-Player Finances")
+    roster_df = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
+    ev_sheets = []
+    for k,v in sheet_map.items():
+        if k.startswith("Event_") and k.endswith("_Standings"):
+            ev_sheets.append(v)
+    fin = build_financial_summary(roster_df, ev_sheets, sheet_map.get("Series_BuyIns", pd.DataFrame()))
+    qcol1, qcol2 = st.columns([2,1])
+    with qcol1:
+        q = st.text_input("Filter by player name", value="")
+    with qcol2:
+        show_only_active = st.checkbox("Active only", value=False)
+    view = fin.copy()
+    if q:
+        view = view[view["Player"].str.contains(q, case=False, na=False)]
+    if show_only_active and "Active" in roster_df.columns:
+        actives = set(roster_df[roster_df["Active"]==True]["Player"])
+        view = view[view["Player"].isin(actives)]
+    st.dataframe(view, use_container_width=True)
+
+with tabs[7]:
     st.dataframe(sheet_map.get("Pools_Ledger", pd.DataFrame()), use_container_width=True)
 
-# Supplies
-with tabs[6]:
+with tabs[8]:
     st.dataframe(sheet_map.get("Supplies", pd.DataFrame()), use_container_width=True)
 
-# Download / Publish
-with tabs[7]:
+with tabs[9]:
     st.subheader("Export your changes")
     with pd.ExcelWriter("updated_tracker.xlsx", engine="openpyxl") as writer:
         for name, df in sheet_map.items():
@@ -267,14 +344,13 @@ with tabs[7]:
     with open("updated_tracker.xlsx","rb") as f:
         updated_bytes = f.read()
     st.download_button("Download updated tracker (.xlsx)", data=updated_bytes, file_name="tracker.xlsx")
-
     st.markdown("---")
     st.subheader("Publish to Player Home (GitHub)")
     if st.button("Publish tracker.xlsx to GitHub"):
         if not owner_repo or not branch or not gh_token:
             st.error("Please provide repo, branch, and a GitHub token (repo scope).")
         else:
-            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app")
+            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.7)")
             if status in (200,201):
                 st.success("Published to GitHub. Player Home will update automatically.")
             else:
