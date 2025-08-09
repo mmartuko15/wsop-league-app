@@ -1,8 +1,8 @@
 
 [theme]
 base="dark"
-primaryColor="#C8A74E"      # gold
-backgroundColor="#0E0F10"   # near black
-secondaryBackgroundColor="#112033"  # navy-ish
+primaryColor="#C8A74E"
+backgroundColor="#0E0F10"
+secondaryBackgroundColor="#112033"
 textColor="#E6E6E6"
 font="sans serif"
