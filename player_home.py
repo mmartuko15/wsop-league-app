@@ -3,7 +3,7 @@ import streamlit as st, pandas as pd, re
 from io import BytesIO
 from pathlib import Path
 
-import base64, requests, pandas as pd, re, os
+import base64, requests, pandas as pd, re
 from io import BytesIO
 from PIL import Image
 
@@ -54,8 +54,20 @@ def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_by
     r = requests.put(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
 
+def show_logo(st, path: str, fallback_title: str = ""):
+    """Safely render a logo; fall back to text if file missing/invalid."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        # Validate image
+        Image.open(BytesIO(data))
+        st.image(path, use_column_width=True)
+    except Exception:
+        if fallback_title:
+            st.markdown(f"**{fallback_title}**")
+
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
-    \"\"\"Builds a leaderboard while tolerating header variations and skipping malformed sheets.\"\"\"
+    """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
     def norm_cols(df):
         mapping = {}
         for c in df.columns:
@@ -116,25 +128,12 @@ def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     g.index = g.index + 1
     return g
 
-def show_logo(st, path):
-    \"\"\"Safely show a logo if the file exists and is a valid image; otherwise show text fallback.\"\"\"
-    try:
-        if path and os.path.exists(path):
-            with open(path, "rb") as f:
-                data = f.read()
-            Image.open(BytesIO(data))  # validate
-            st.image(path, use_column_width=True)
-        else:
-            st.markdown("**WSOP League**")
-    except Exception:
-        st.markdown("**WSOP League**")
-
 
 st.set_page_config(page_title="WSOP League — Player Home", page_icon="🃏", layout="wide")
 
 col_logo, col_title = st.columns([1,4])
 with col_logo:
-    show_logo(st, "league_logo.png")
+    show_logo(st, "league_logo.png", "WSOP League")
 with col_title:
     st.markdown("### Mark & Rose's WSOP League — Player Home")
     st.caption("Countryside Country Club • Start 6:30 PM")
@@ -228,7 +227,7 @@ with tabs[5]:
     st.subheader("Second Chance Pool & Opt-Ins")
     st.dataframe(optins, use_container_width=True)
     sc_pool = (optins["Buy-In ($)"].fillna(0).sum()) if not optins.empty else 0.0
-    st.write(f"**Second Chance Pool (live):** ${sc_pool:,.2f}  \\nPayout 50/30/20 at season end.")
+    st.write(f"**Second Chance Pool (live):** ${sc_pool:,.2f}  \nPayout 50/30/20 at season end.")
 
 with tabs[6]:
     def build_financials(sheet_map):
@@ -275,7 +274,7 @@ with tabs[6]:
         out["Net Winnings"] = out["Total Earned"] - out["Total Paid In"]
 
         cols = ["Player","Events Played","Initial Buy-Ins Paid","Nightly Fees Paid","Bounty Contributions Paid","Nightly Payouts Earned","Bounties Earned","Total Paid In","Total Earned","Net Winnings"]
-        return out[cols].sort_values(["Net Winnings","Total Earned"], ascending=[False,False]).reset_index(drop=True)
+        return out[cols].sort_values(["Net Winnings","Total Earned"], ascending=[False,False]).reset_index(drop=True]
 
     fin = build_financials(sheet_map)
     st.dataframe(fin, use_container_width=True)
