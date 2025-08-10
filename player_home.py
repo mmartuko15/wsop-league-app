@@ -3,7 +3,7 @@ import streamlit as st, pandas as pd, re
 from io import BytesIO
 from pathlib import Path
 
-import base64, requests, pandas as pd, re, io
+import base64, requests, pandas as pd, re
 from io import BytesIO
 from PIL import Image
 
@@ -12,29 +12,33 @@ POINTS = {1:14,2:11,3:9,4:7,5:5,6:4,7:3,8:2,9:1,10:0.5}
 def parse_money(x):
     if pd.isna(x): return 0.0
     if isinstance(x,(int,float)): return float(x)
-    s = str(x).replace("$","").replace(",","").strip()
-    try: return float(s)
-    except: return 0.0
+    s = str(x)
+    s = s.replace("$","").replace(",","").strip()
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    try:
+        v = float(s)
+        return -v if neg else v
+    except:
+        return 0.0
 
 def pools_balance_robust(pools_df, pool_name):
-    """Case-insensitive, parses currency, Accrual=+, Payout=-"""
-    if pools_df is None or len(pools_df)==0:
-        return 0.0
+    if pools_df is None or pools_df.empty: return 0.0
     df = pools_df.copy()
-    # normalize headers
-    norm = {c: re.sub(r'[^a-z0-9]', '', str(c).lower()) for c in df.columns}
-    df.columns = [norm[c] for c in df.columns]
-    # map essential columns
-    tcol = next((c for c in df.columns if c in ("type","entrytype")), None)
-    pcol = next((c for c in df.columns if c in ("pool","fund")), None)
-    acol = next((c for c in df.columns if c in ("amount","amt","value")), None)
-    if not (tcol and pcol and acol):
+    cols = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in df.columns}
+    type_col = cols.get("type")
+    pool_col = cols.get("pool")
+    amt_col  = cols.get("amount") or cols.get("amt") or cols.get("value")
+    if not (type_col and pool_col and amt_col):
         return 0.0
-    df[acol] = df[acol].apply(parse_money)
-    df[pcol] = df[pcol].astype(str).str.strip().str.lower()
-    sign = df[tcol].astype(str).str.strip().str.lower().map({"accrual":1,"payout":-1}).fillna(1)
-    sub = df[df[pcol] == str(pool_name).strip().lower()]
-    return float((sub[acol] * sign.loc[sub.index]).sum())
+    df["_type"] = df[type_col].astype(str).str.strip().str.lower()
+    df["_pool"] = df[pool_col].astype(str).str.strip().str.lower()
+    df["_amt"]  = df[amt_col].apply(parse_money)
+    df["_sign"] = df["_type"].map({"accrual":1,"payout":-1}).fillna(1)
+    mask = df["_pool"]==pool_name.lower()
+    return float((df.loc[mask, "_amt"] * df.loc[mask, "_sign"]).sum())
 
 def read_tracker_bytes(file_bytes: bytes) -> dict:
     return pd.read_excel(BytesIO(file_bytes), sheet_name=None, engine="openpyxl")
@@ -67,19 +71,6 @@ def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_by
     r = requests.put(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
 
-def show_logo(st, primary="league_logo.jpg", secondary="league_logo.png"):
-    """Attempt to display JPG then PNG; fallback to text if invalid/missing."""
-    for path in (primary, secondary):
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-            Image.open(io.BytesIO(data))  # validate
-            st.image(data, use_column_width=True)
-            return
-        except Exception:
-            continue
-    st.write("### Mark & Rose's WSOP League")
-
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
     def norm_cols(df):
@@ -97,12 +88,12 @@ def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
 
     frames = []
     for name, df in (sheet_map or {}).items():
-        if not isinstance(df, pd.DataFrame): 
+        if not isinstance(df, pd.DataFrame):
             continue
         nm = str(name).lower()
         if not (nm.startswith("event_") and nm.endswith("_standings")):
             continue
-        if df.empty: 
+        if df.empty:
             continue
 
         df2 = norm_cols(df)
@@ -142,20 +133,27 @@ def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     g.index = g.index + 1
     return g
 
+def show_logo(st, primary="league_logo.jpg", fallback="league_logo.png"):
+    try:
+        st.image(primary, use_column_width=True)
+    except Exception:
+        try:
+            st.image(fallback, use_column_width=True)
+        except Exception:
+            st.markdown("### Mark & Rose's WSOP League")
+
 
 st.set_page_config(page_title="WSOP League — Player Home", page_icon="🃏", layout="wide")
 
-# Header
 col_logo, col_title = st.columns([1,4])
 with col_logo:
-    show_logo(st)  # prefers JPG, then PNG, fallback text
+    show_logo(st)
 with col_title:
     st.markdown("### Mark & Rose's WSOP League — Player Home")
     st.caption("Countryside Country Club • Start 6:30 PM")
 
 st.divider()
 
-# Data source
 default_map, _ = read_local_tracker()
 uploaded = st.sidebar.file_uploader("(Optional) Upload tracker (.xlsx)", type=["xlsx"])
 
@@ -167,7 +165,6 @@ else:
     st.info("Waiting for tracker.xlsx to be present in the repo (or upload one).")
     st.stop()
 
-# KPIs (robust)
 pools = sheet_map.get("Pools_Ledger", pd.DataFrame())
 wsop_total = pools_balance_robust(pools,"WSOP")
 bounty_total = pools_balance_robust(pools,"Bounty")
@@ -183,16 +180,13 @@ k5.metric("Nightly Pool (post-payout)", f"${nightly_total:,.2f}")
 
 tabs = st.tabs(["Leaderboard","Events","Nightly Payouts","Bounties","High Hand","Second Chance","Player Finances","About"])
 
-# Leaderboard
 with tabs[0]:
     lb = robust_leaderboard(sheet_map)
     st.dataframe(lb, use_container_width=True)
 
-# Events
 with tabs[1]:
     st.dataframe(sheet_map.get("Events", pd.DataFrame()), use_container_width=True)
 
-# Nightly Payouts
 with tabs[2]:
     ev_sheets = [k for k in sheet_map.keys() if str(k).startswith("Event_") and str(k).endswith("_Standings")]
     if ev_sheets:
@@ -210,7 +204,6 @@ with tabs[2]:
     else:
         st.info("Standings will appear after events are uploaded.")
 
-# Bounties
 with tabs[3]:
     ev_sheets = [k for k in sheet_map.keys() if str(k).startswith("Event_") and str(k).endswith("_Standings")]
     if ev_sheets:
@@ -230,7 +223,6 @@ with tabs[3]:
     st.write(f"**Bounty Pool (live):** ${bounty_total:,.2f}")
     st.caption("Winner keeps their own $5 bounty; pool pays at final event.")
 
-# High Hand
 with tabs[4]:
     hh = sheet_map.get("HighHand_Info", pd.DataFrame())
     holder = hand_desc = override_val = ""
@@ -244,7 +236,6 @@ with tabs[4]:
     st.write(f"**Hand:** {hand_desc if hand_desc else '—'}")
     st.write(f"**Jackpot Value:** {amt}")
 
-# Second Chance
 with tabs[5]:
     optins = sheet_map.get("SecondChance_OptIns", pd.DataFrame())
     st.subheader("Second Chance Pool & Opt-Ins")
@@ -252,7 +243,6 @@ with tabs[5]:
     sc_pool = (optins["Buy-In ($)"].fillna(0).sum()) if not optins.empty else 0.0
     st.write(f"**Second Chance Pool (live):** ${sc_pool:,.2f}  \nPayout 50/30/20 at season end.")
 
-# Player Finances (read-only)
 with tabs[6]:
     def build_financials(sheet_map):
         ev_sheets = [k for k in sheet_map.keys() if str(k).startswith("Event_") and str(k).endswith("_Standings")]
@@ -303,6 +293,5 @@ with tabs[6]:
     fin = build_financials(sheet_map)
     st.dataframe(fin, use_container_width=True)
 
-# About
 with tabs[7]:
     st.write("Read-only view of league standings and finances.")
