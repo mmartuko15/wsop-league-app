@@ -77,18 +77,16 @@ def github_test(owner_repo: str, branch: str, token: str):
         return False, "Branch is blank."
     r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
     if r.status_code == 404:
-        return False, "Repository not found (check owner/repo spelling and token access)."
+        return False, "Repository not found (check owner/repo spelling and that your token can see it)."
     if r.status_code in (401,403):
-        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO)."
+        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
     r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
     if r2.status_code == 404:
         return False, f"Branch '{branch}' not found."
     if r2.status_code in (401,403):
         return False, "Branch access denied. Token lacks permissions."
-    # write test
-    test_bytes = b"wsop-league write test"
     url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
-    payload = {"message": "write-test", "content": base64.b64encode(test_bytes).decode("utf-8"), "branch": branch}
+    payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
     r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
     if r3.status_code in (200,201):
         try:
@@ -107,64 +105,44 @@ def github_test(owner_repo: str, branch: str, token: str):
     return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
 
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
-    """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
     def norm_cols(df):
         mapping = {}
         for c in df.columns:
             key = re.sub(r'[^a-z0-9]', '', str(c).lower())
             mapping[c] = key
         return df.rename(columns=mapping)
-
     def pick(colset, *candidates):
         for cand in candidates:
             if cand in colset:
                 return cand
         return None
-
     frames = []
     for name, df in (sheet_map or {}).items():
-        if not isinstance(df, pd.DataFrame):
-            continue
+        if not isinstance(df, pd.DataFrame): continue
         nm = str(name).lower()
-        if not (nm.startswith("event_") and nm.endswith("_standings")):
-            continue
-        if df.empty:
-            continue
-
-        df2 = norm_cols(df)
-        colset = set(df2.columns)
-
-        player_key = pick(colset, "player", "name")
-        place_key  = pick(colset, "place", "rank", "finish", "position")
-        kos_key    = pick(colset, "kos", "ko", "knockouts", "knockout", "eliminations", "elimination", "elims", "numeliminated", "eliminated")
-
-        if not player_key or not place_key:
-            continue
-
+        if not (nm.startswith("event_") and nm.endswith("_standings")): continue
+        if df.empty: continue
+        df2 = norm_cols(df); colset = set(df2.columns)
+        player_key = pick(colset,"player","name")
+        place_key  = pick(colset,"place","rank","finish","position")
+        kos_key    = pick(colset,"kos","ko","knockouts","knockout","eliminations","elimination","elims","numeliminated","eliminated")
+        if not player_key or not place_key: continue
         t = pd.DataFrame()
         t["Player"] = df2[player_key].astype(str).str.strip()
         t["Place"]  = pd.to_numeric(df2[place_key], errors="coerce")
-        if kos_key and kos_key in df2.columns:
-            t["KOs"] = pd.to_numeric(df2[kos_key], errors="coerce").fillna(0).astype(int)
-        else:
-            t["KOs"] = 0
-
+        t["KOs"]    = pd.to_numeric(df2[kos_key], errors="coerce").fillna(0).astype(int) if (kos_key and kos_key in df2.columns) else 0
         t = t.dropna(subset=["Place"])
         t["Points"] = t["Place"].map(POINTS).fillna(0)
         frames.append(t)
-
     if not frames:
         return pd.DataFrame(columns=["Player","Total Points","Total KOs","Events Played"])
-
     all_ev = pd.concat(frames, ignore_index=True)
-    g = (
-        all_ev.groupby("Player", as_index=False)
-        .agg(Total_Points=("Points","sum"),
-             Total_KOs=("KOs","sum"),
-             Events_Played=("Points","count"))
-        .sort_values(["Total_Points","Total_KOs"], ascending=[False,False])
-        .reset_index(drop=True)
-    )
+    g = (all_ev.groupby("Player", as_index=False)
+         .agg(Total_Points=("Points","sum"),
+              Total_KOs=("KOs","sum"),
+              Events_Played=("Points","count"))
+         .sort_values(["Total_Points","Total_KOs"], ascending=[False,False])
+         .reset_index(drop=True))
     g.index = g.index + 1
     return g
 
@@ -211,7 +189,6 @@ gh_token = st.secrets.get("GITHUB_TOKEN", "")
 if not gh_token:
     gh_token = st.sidebar.text_input("GitHub token (repo scope)", type="password")
 
-# Test button
 if st.sidebar.button("Test GitHub connection"):
     ok, msg = github_test(owner_repo, branch, gh_token)
     (st.sidebar.success if ok else st.sidebar.error)(msg)
@@ -396,17 +373,13 @@ with tabs[6]:
             t["BountyEarned"] = pd.to_numeric(df[kos_col], errors="coerce").fillna(0).astype(int)*5 if kos_col else 0
             ev_frames.append(t)
         all_rows = pd.concat(ev_frames, ignore_index=True) if ev_frames else pd.DataFrame(columns=["Player","Payout_Amount","BountyEarned"])
-
         players_df = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
         base = players_df[["Player"]].dropna().drop_duplicates().copy()
-
         events_played = all_rows.groupby("Player").size().rename("Events Played").to_frame()
         nightly_earned = all_rows.groupby("Player")["Payout_Amount"].sum().rename("Nightly Payouts Earned").to_frame()
         bounties_earned = all_rows.groupby("Player")["BountyEarned"].sum().rename("Bounties Earned").to_frame()
-
         buyins = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount"])).copy()
         initial_buyins_paid = buyins.groupby("Player")["Amount"].sum().rename("Initial Buy-Ins Paid").to_frame() if not buyins.empty else pd.DataFrame(columns=["Initial Buy-Ins Paid"])
-
         out = base.merge(events_played, left_on="Player", right_index=True, how="left")
         out = out.merge(nightly_earned, left_on="Player", right_index=True, how="left")
         out = out.merge(bounties_earned, left_on="Player", right_index=True, how="left")
@@ -414,112 +387,15 @@ with tabs[6]:
         out["Nightly Fees Paid"] = out["Events Played"] * 55.0
         out["Bounty Contributions Paid"] = out["Events Played"] * 5.0
         out = out.merge(initial_buyins_paid, left_on="Player", right_index=True, how="left")
-
         for col in ["Nightly Payouts Earned","Bounties Earned","Initial Buy-Ins Paid"]:
             out[col] = out[col].fillna(0.0)
-
         out["Total Paid In"] = out["Initial Buy-Ins Paid"] + out["Nightly Fees Paid"]
         out["Total Earned"] = out["Nightly Payouts Earned"] + out["Bounties Earned"]
         out["Net Winnings"] = out["Total Earned"] - out["Total Paid In"]
-
         cols = ["Player","Events Played","Initial Buy-Ins Paid","Nightly Fees Paid","Bounty Contributions Paid","Nightly Payouts Earned","Bounties Earned","Total Paid In","Total Earned","Net Winnings"]
         return out[cols].sort_values(["Net Winnings","Total Earned"], ascending=[False,False]).reset_index(drop=True)
-
     fin = build_financials(sheet_map)
     st.dataframe(fin, use_container_width=True)
 
 with tabs[7]:
-    st.subheader("Pools Ledger")
-    st.dataframe(sheet_map.get("Pools_Ledger", pd.DataFrame()), use_container_width=True)
-    st.markdown("---")
-    st.markdown("#### One-click Sync")
-    pools = sheet_map.get("Pools_Ledger", pd.DataFrame(columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])).copy()
-
-    if st.button("Sync from Series Buy-Ins → WSOP accruals"):
-        buyins = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount","Date"]))
-        add = []
-        for _, r in buyins.iterrows():
-            amt = parse_money(r.get("Amount", 0))
-            if amt == 0: 
-                continue
-            d = str(r.get("Date", "")) or str(date.today())
-            note = f"Series buy-in — {r.get('Player','')}"
-            add.append([d, 0, "Accrual", "WSOP", float(amt), "", note])
-        if add:
-            newdf = pd.DataFrame(add, columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])
-            pools = pd.concat([pools, newdf], ignore_index=True)
-            pools = pools.drop_duplicates(subset=["Date","Event #","Type","Pool","Amount","Note"], keep="first").reset_index(drop=True)
-            sheet_map["Pools_Ledger"] = pools
-            st.success(f"Added {len(add)} WSOP accrual rows from Series_BuyIns.")
-        else:
-            st.info("No buy-ins to sync.")
-
-    if st.button("Backfill Event Accruals/Payouts"):
-        events_df = sheet_map.get("Events", pd.DataFrame())
-        colmap = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in (events_df.columns if not events_df.empty else [])}
-        event_num_col = colmap.get("event")
-        date_col = colmap.get("date")
-
-        ev_sheets = [k for k in sheet_map if str(k).startswith("Event_") and str(k).endswith("_Standings")]
-        add = []
-        for s in ev_sheets:
-            try:
-                ev_num = int(s.split("_")[1])
-            except:
-                continue
-            ev_date = None
-            if not events_df.empty and event_num_col and date_col:
-                try:
-                    ev_date = str(events_df.loc[events_df[event_num_col]==ev_num, date_col].iloc[0])
-                except:
-                    pass
-            if not ev_date:
-                ev_date = str(date.today())
-
-            df = sheet_map[s]
-            cols = {re.sub(r'[^a-z0-9]','', c.lower()): c for c in df.columns}
-            pcol = cols.get("player") or cols.get("name")
-            payout_col = cols.get("payout") or cols.get("payoutamount")
-            if not (pcol and payout_col):
-                continue
-            attendees = int(df[pcol].dropna().shape[0])
-            payout_sum = float(df[payout_col].apply(parse_money).sum())
-            add.extend([
-                [ev_date, ev_num, "Accrual","WSOP",      3*attendees,  "", "WSOP addl funding ($3 x players)"],
-                [ev_date, ev_num, "Accrual","Nightly",  45*attendees, "", "Nightly payout funding ($45 x players)"],
-                [ev_date, ev_num, "Accrual","Bounty",    5*attendees, "", "Bounty pool funding ($5 x players)"],
-                [ev_date, ev_num, "Accrual","High Hand", 2*attendees, "", "High hand funding ($2 x players)"],
-                [ev_date, ev_num, "Payout","Nightly",    payout_sum,  "Yes", "Paid out on event night based on finish order"],
-            ])
-        if add:
-            newdf = pd.DataFrame(add, columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])
-            pools = pd.concat([pools, newdf], ignore_index=True)
-            pools = pools.drop_duplicates(subset=["Date","Event #","Type","Pool","Amount","Note"], keep="first").reset_index(drop=True)
-            sheet_map["Pools_Ledger"] = pools
-            st.success(f"Backfilled {len(add)} ledger rows from event sheets.")
-        else:
-            st.info("No event sheets found to backfill.")
-
-with tabs[8]:
-    st.dataframe(sheet_map.get("Supplies", pd.DataFrame()), use_container_width=True)
-
-with tabs[9]:
-    st.subheader("Export your changes")
-    with pd.ExcelWriter("updated_tracker.xlsx", engine="openpyxl") as writer:
-        for name, df in sheet_map.items():
-            df.to_excel(writer, sheet_name=str(name)[:31], index=False)
-    with open("updated_tracker.xlsx","rb") as f:
-        updated_bytes = f.read()
-    st.download_button("Download updated tracker (.xlsx)", data=updated_bytes, file_name="tracker.xlsx")
-
-    st.markdown("---")
-    st.subheader("Publish to Player Home (GitHub)")
-    if st.button("Publish tracker.xlsx to GitHub"):
-        if not owner_repo or not branch or not gh_token:
-            st.error("Provide repo (owner/repo), branch, and GITHUB_TOKEN secret.")
-        else:
-            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.8.5)")
-            if status in (200,201):
-                st.success("Published to GitHub. Player Home will update automatically.")
-            else:
-                st.error(f"GitHub API response: {status} — {text}")
+    st.write("Read-only view of league standings and finances.")

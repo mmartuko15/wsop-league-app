@@ -1,5 +1,5 @@
 
-import streamlit as st, pandas as pd, re
+import streamlit as st, pandas as pd, re, base64, requests
 from io import BytesIO
 
 import base64, requests, pandas as pd, re
@@ -75,18 +75,16 @@ def github_test(owner_repo: str, branch: str, token: str):
         return False, "Branch is blank."
     r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
     if r.status_code == 404:
-        return False, "Repository not found (check owner/repo spelling and token access)."
+        return False, "Repository not found (check owner/repo spelling and that your token can see it)."
     if r.status_code in (401,403):
-        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO)."
+        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
     r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
     if r2.status_code == 404:
         return False, f"Branch '{branch}' not found."
     if r2.status_code in (401,403):
         return False, "Branch access denied. Token lacks permissions."
-    # write test
-    test_bytes = b"wsop-league write test"
     url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
-    payload = {"message": "write-test", "content": base64.b64encode(test_bytes).decode("utf-8"), "branch": branch}
+    payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
     r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
     if r3.status_code in (200,201):
         try:
@@ -105,64 +103,44 @@ def github_test(owner_repo: str, branch: str, token: str):
     return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
 
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
-    """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
     def norm_cols(df):
         mapping = {}
         for c in df.columns:
             key = re.sub(r'[^a-z0-9]', '', str(c).lower())
             mapping[c] = key
         return df.rename(columns=mapping)
-
     def pick(colset, *candidates):
         for cand in candidates:
             if cand in colset:
                 return cand
         return None
-
     frames = []
     for name, df in (sheet_map or {}).items():
-        if not isinstance(df, pd.DataFrame):
-            continue
+        if not isinstance(df, pd.DataFrame): continue
         nm = str(name).lower()
-        if not (nm.startswith("event_") and nm.endswith("_standings")):
-            continue
-        if df.empty:
-            continue
-
-        df2 = norm_cols(df)
-        colset = set(df2.columns)
-
-        player_key = pick(colset, "player", "name")
-        place_key  = pick(colset, "place", "rank", "finish", "position")
-        kos_key    = pick(colset, "kos", "ko", "knockouts", "knockout", "eliminations", "elimination", "elims", "numeliminated", "eliminated")
-
-        if not player_key or not place_key:
-            continue
-
+        if not (nm.startswith("event_") and nm.endswith("_standings")): continue
+        if df.empty: continue
+        df2 = norm_cols(df); colset = set(df2.columns)
+        player_key = pick(colset,"player","name")
+        place_key  = pick(colset,"place","rank","finish","position")
+        kos_key    = pick(colset,"kos","ko","knockouts","knockout","eliminations","elimination","elims","numeliminated","eliminated")
+        if not player_key or not place_key: continue
         t = pd.DataFrame()
         t["Player"] = df2[player_key].astype(str).str.strip()
         t["Place"]  = pd.to_numeric(df2[place_key], errors="coerce")
-        if kos_key and kos_key in df2.columns:
-            t["KOs"] = pd.to_numeric(df2[kos_key], errors="coerce").fillna(0).astype(int)
-        else:
-            t["KOs"] = 0
-
+        t["KOs"]    = pd.to_numeric(df2[kos_key], errors="coerce").fillna(0).astype(int) if (kos_key and kos_key in df2.columns) else 0
         t = t.dropna(subset=["Place"])
         t["Points"] = t["Place"].map(POINTS).fillna(0)
         frames.append(t)
-
     if not frames:
         return pd.DataFrame(columns=["Player","Total Points","Total KOs","Events Played"])
-
     all_ev = pd.concat(frames, ignore_index=True)
-    g = (
-        all_ev.groupby("Player", as_index=False)
-        .agg(Total_Points=("Points","sum"),
-             Total_KOs=("KOs","sum"),
-             Events_Played=("Points","count"))
-        .sort_values(["Total_Points","Total_KOs"], ascending=[False,False])
-        .reset_index(drop=True)
-    )
+    g = (all_ev.groupby("Player", as_index=False)
+         .agg(Total_Points=("Points","sum"),
+              Total_KOs=("KOs","sum"),
+              Events_Played=("Points","count"))
+         .sort_values(["Total_Points","Total_KOs"], ascending=[False,False])
+         .reset_index(drop=True))
     g.index = g.index + 1
     return g
 
@@ -187,16 +165,54 @@ with col_title:
 
 st.divider()
 
-default_map, _ = read_local_tracker()
-uploaded = st.sidebar.file_uploader("(Optional) Upload tracker (.xlsx)", type=["xlsx"])
+st.sidebar.header("Load tracker from")
+mode = st.sidebar.radio("Source", ["Repo file (default)", "Upload file", "Fetch from GitHub now"], index=0)
 
-if uploaded is not None:
-    sheet_map = read_tracker_bytes(uploaded.read())
-elif default_map is not None:
-    sheet_map = default_map
+sheet_map = None
+source_label = ""
+last_updated = ""
+
+if mode == "Upload file":
+    uploaded = st.sidebar.file_uploader("Upload tracker (.xlsx)", type=["xlsx"])
+    if uploaded:
+        sheet_map = read_tracker_bytes(uploaded.read())
+        source_label = "Uploaded file"
+elif mode == "Fetch from GitHub now":
+    owner_repo = st.sidebar.text_input("Owner/Repo", value="mmartuko15/wsop-league-app")
+    branch = st.sidebar.text_input("Branch", value="main")
+    token = st.secrets.get("PLAYER_GITHUB_TOKEN", "")
+    if not token:
+        token = st.sidebar.text_input("GitHub token (read-only)", type="password")
+    if st.sidebar.button("Fetch latest"):
+        try:
+            url = f"https://api.github.com/repos/{owner_repo}/contents/tracker.xlsx"
+            headers = {"Authorization": f"token {token}"} if token else {}
+            params = {"ref": branch}
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            content = base64.b64decode(r.json()["content"])
+            sheet_map = read_tracker_bytes(content)
+            source_label = f"GitHub API — {owner_repo}@{branch}"
+        except Exception as e:
+            st.sidebar.error(f"Fetch failed: {e}")
 else:
-    st.info("Waiting for tracker.xlsx to be present in the repo (or upload one).")
+    default_map, _ = read_local_tracker()
+    if default_map is not None:
+        sheet_map = default_map
+        source_label = "Repo file (bundled)"
+
+if sheet_map is None:
+    st.info("No tracker loaded yet. Choose a data source in the sidebar.")
     st.stop()
+
+hh = sheet_map.get("HighHand_Info", pd.DataFrame())
+if not hh.empty and "Last Updated" in hh.columns:
+    try:
+        last_updated = str(hh["Last Updated"].iloc[0])
+    except Exception:
+        last_updated = ""
+
+st.info(f"**Data source:** {source_label}" + (f"  •  **High Hand last updated:** {last_updated}" if last_updated else ""))
 
 pools = sheet_map.get("Pools_Ledger", pd.DataFrame())
 wsop_total = pools_balance_robust(pools,"WSOP")
@@ -274,9 +290,9 @@ with tabs[3]:
     st.caption("Winner keeps their own $5 bounty; pool pays at final event.")
 
 with tabs[4]:
-    hh = sheet_map.get("HighHand_Info", pd.DataFrame())
     holder = hand_desc = override_val = ""
-    if not hh.empty:
+    if "HighHand_Info" in sheet_map and not sheet_map["HighHand_Info"].empty:
+        hh = sheet_map["HighHand_Info"]
         holder = str(hh.get("Current Holder", [""])[0])
         hand_desc = str(hh.get("Hand Description", [""])[0])
         override_val = str(hh.get("Display Value (override)", [""])[0])
@@ -311,17 +327,13 @@ with tabs[6]:
             t["BountyEarned"] = pd.to_numeric(df[kos_col], errors="coerce").fillna(0).astype(int)*5 if kos_col else 0
             ev_frames.append(t)
         all_rows = pd.concat(ev_frames, ignore_index=True) if ev_frames else pd.DataFrame(columns=["Player","Payout_Amount","BountyEarned"])
-
         players_df = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
         base = players_df[["Player"]].dropna().drop_duplicates().copy()
-
         events_played = all_rows.groupby("Player").size().rename("Events Played").to_frame()
         nightly_earned = all_rows.groupby("Player")["Payout_Amount"].sum().rename("Nightly Payouts Earned").to_frame()
         bounties_earned = all_rows.groupby("Player")["BountyEarned"].sum().rename("Bounties Earned").to_frame()
-
         buyins = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount"])).copy()
         initial_buyins_paid = buyins.groupby("Player")["Amount"].sum().rename("Initial Buy-Ins Paid").to_frame() if not buyins.empty else pd.DataFrame(columns=["Initial Buy-Ins Paid"])
-
         out = base.merge(events_played, left_on="Player", right_index=True, how="left")
         out = out.merge(nightly_earned, left_on="Player", right_index=True, how="left")
         out = out.merge(bounties_earned, left_on="Player", right_index=True, how="left")
@@ -329,17 +341,13 @@ with tabs[6]:
         out["Nightly Fees Paid"] = out["Events Played"] * 55.0
         out["Bounty Contributions Paid"] = out["Events Played"] * 5.0
         out = out.merge(initial_buyins_paid, left_on="Player", right_index=True, how="left")
-
         for col in ["Nightly Payouts Earned","Bounties Earned","Initial Buy-Ins Paid"]:
             out[col] = out[col].fillna(0.0)
-
         out["Total Paid In"] = out["Initial Buy-Ins Paid"] + out["Nightly Fees Paid"]
         out["Total Earned"] = out["Nightly Payouts Earned"] + out["Bounties Earned"]
         out["Net Winnings"] = out["Total Earned"] - out["Total Paid In"]
-
         cols = ["Player","Events Played","Initial Buy-Ins Paid","Nightly Fees Paid","Bounty Contributions Paid","Nightly Payouts Earned","Bounties Earned","Total Paid In","Total Earned","Net Winnings"]
         return out[cols].sort_values(["Net Winnings","Total Earned"], ascending=[False,False]).reset_index(drop=True)
-
     fin = build_financials(sheet_map)
     st.dataframe(fin, use_container_width=True)
 
