@@ -12,12 +12,10 @@ POINTS = {1:14,2:11,3:9,4:7,5:5,6:4,7:3,8:2,9:1,10:0.5}
 def parse_money(x):
     if pd.isna(x): return 0.0
     if isinstance(x,(int,float)): return float(x)
-    s = str(x)
-    s = s.replace("$","").replace(",","").strip()
+    s = str(x).replace("$","").replace(",","").strip()
     neg = False
     if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1]
+        neg = True; s = s[1:-1]
     try:
         v = float(s)
         return -v if neg else v
@@ -70,6 +68,51 @@ def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_by
         payload["sha"] = sha
     r = requests.put(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
+
+def github_test(owner_repo: str, branch: str, token: str):
+    """Return (ok: bool, message: str). Checks repo existence, branch, and write permission to tracker.xlsx."""
+    if not owner_repo or "/" not in owner_repo:
+        return False, "Owner/Repo is blank or malformed. Expected 'owner/repo'."
+    if not branch:
+        return False, "Branch is blank."
+
+    # 1) Repo exists?
+    r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
+    if r.status_code == 404:
+        return False, "Repository not found (check owner/repo spelling and that your token can see it)."
+    if r.status_code == 401 or r.status_code == 403:
+        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
+
+    # 2) Branch exists?
+    r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
+    if r2.status_code == 404:
+        return False, f"Branch '{branch}' not found."
+    if r2.status_code in (401,403):
+        return False, f"Branch access denied. Token lacks permissions."
+
+    # 3) Write permission? Try to PUT a tiny test file in memory (dry run target path)
+    import os
+    test_bytes = b"wsop-league write test"
+    url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
+    payload = {"message": "write-test", "content": base64.b64encode(test_bytes).decode("utf-8"), "branch": branch}
+    r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
+    if r3.status_code in (200,201):
+        # cleanup attempt (best-effort)
+        try:
+            sha = r3.json().get("content",{}).get("sha")
+            if sha:
+                requests.delete(url, headers={"Authorization": f"token {token}"} if token else {}, json={"message":"cleanup write-test","sha":sha,"branch":branch}, timeout=20)
+        except Exception:
+            pass
+        return True, "Connection OK. Repo, branch, and write permission verified."
+    elif r3.status_code == 404:
+        return False, "Write failed with 404. Repo/branch path not reachable with this token."
+    elif r3.status_code == 401:
+        return False, "Unauthorized (401). Token missing or invalid."
+    elif r3.status_code == 403:
+        return False, "Forbidden (403). Token lacks 'repo' scope or SSO not authorized."
+    else:
+        return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
 
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
@@ -197,10 +240,9 @@ with tabs[2]:
             payout_col = cols.get("payout")
             if not (pcol and payout_col):
                 continue
-            view = df[[pcol, payout_col]].copy()
-            view.columns = ["Player","Payout"]
+            view = build_event_view(df)
             st.write(f"**{s}**")
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(view, use_container_width=True, hide_index=True)
     else:
         st.info("Standings will appear after events are uploaded.")
 
@@ -214,12 +256,13 @@ with tabs[3]:
             kos_col = cols.get("kos") or cols.get("knockouts") or cols.get("eliminations") or cols.get("elims")
             if not pcol:
                 continue
-            view = pd.DataFrame()
-            view["Player"] = df[pcol]
-            view["KOs"] = pd.to_numeric(df[kos_col], errors="coerce").fillna(0).astype(int) if kos_col else 0
-            view["Bounty $"] = view["KOs"] * 5
+            view = build_event_view(df)
+            # Add KOs and Bounty $
+            kos_vals = pd.to_numeric(df[kos_col], errors="coerce").fillna(0).astype(int) if kos_col else 0
+            view["KOs"] = kos_vals
+            view["Bounty $"] = (kos_vals * 5) if isinstance(kos_vals, int) == False else (view["KOs"] * 5)
             st.write(f"**{s}**")
-            st.dataframe(view, use_container_width=True)
+            st.dataframe(view, use_container_width=True, hide_index=True)
     st.write(f"**Bounty Pool (live):** ${bounty_total:,.2f}")
     st.caption("Winner keeps their own $5 bounty; pool pays at final event.")
 
