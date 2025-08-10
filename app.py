@@ -1,8 +1,12 @@
 
-
-import streamlit as st, pandas as pd, re, base64, requests, json, time
+import streamlit as st, pandas as pd, base64, re, json, webbrowser, time
 from io import BytesIO
-from datetime import datetime
+from pathlib import Path
+from datetime import date
+
+import base64, requests, pandas as pd, re, json
+from io import BytesIO
+from PIL import Image
 
 POINTS = {1:14,2:11,3:9,4:7,5:5,6:4,7:3,8:2,9:1,10:0.5}
 
@@ -10,195 +14,206 @@ def parse_money(x):
     if pd.isna(x): return 0.0
     if isinstance(x,(int,float)): return float(x)
     s = str(x).replace("$","").replace(",","").strip()
-    neg = s.startswith("(") and s.endswith(")")
-    if neg: s = s[1:-1]
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True; s = s[1:-1]
     try:
-        v = float(s); return -v if neg else v
-    except: return 0.0
+        v = float(s)
+        return -v if neg else v
+    except:
+        return 0.0
 
-def pools_balance_robust(df, pool_name):
-    if df is None or df.empty: return 0.0
+def pools_balance_robust(pools_df, pool_name):
+    if pools_df is None or pools_df.empty: return 0.0
+    df = pools_df.copy()
     cols = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in df.columns}
-    tcol = cols.get("type"); pcol = cols.get("pool"); acol = cols.get("amount") or cols.get("amt")
-    if not (tcol and pcol and acol): return 0.0
-    tmp = pd.DataFrame({
-        "type": df[tcol].astype(str).str.strip().str.lower(),
-        "pool": df[pcol].astype(str).str.strip().str.lower(),
-        "amt": df[acol].apply(parse_money)
-    })
-    tmp["sign"] = tmp["type"].map({"accrual":1,"payout":-1}).fillna(1)
-    return float((tmp[tmp["pool"]==pool_name.lower()]["amt"]*tmp[tmp["pool"]==pool_name.lower()]["sign"]).sum())
+    type_col = cols.get("type"); pool_col = cols.get("pool")
+    amt_col  = cols.get("amount") or cols.get("amt") or cols.get("value")
+    if not (type_col and pool_col and amt_col): return 0.0
+    df["_type"] = df[type_col].astype(str).str.strip().str.lower()
+    df["_pool"] = df[pool_col].astype(str).str.strip().str.lower()
+    df["_amt"]  = df[amt_col].apply(parse_money)
+    df["_sign"] = df["_type"].map({"accrual":1,"payout":-1}).fillna(1)
+    mask = df["_pool"]==pool_name.lower()
+    return float((df.loc[mask, "_amt"] * df.loc[mask, "_sign"]).sum())
 
-def read_tracker_bytes(b): return pd.read_excel(BytesIO(b), sheet_name=None, engine="openpyxl")
+def read_tracker_bytes(file_bytes: bytes) -> dict:
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=None, engine="openpyxl")
+
 def read_local_tracker():
     try:
-        with open("tracker.xlsx","rb") as f: b=f.read()
-        return read_tracker_bytes(b), b
-    except: return (None,None)
+        with open("tracker.xlsx","rb") as f:
+            b = f.read()
+        return (read_tracker_bytes(b), b)
+    except Exception:
+        return (None, None)
 
-def github_put(owner_repo, path, branch, token, file_bytes, message):
-    import base64
-    url=f"https://api.github.com/repos/{owner_repo}/contents/{path}"
-    hdr={"Authorization":f"token {token}"} if token else {}
-    def getsha():
-        r=requests.get(url,headers=hdr,params={"ref":branch},timeout=20)
-        if r.status_code==200: return r.json().get("sha")
-        return None
-    payload={"message":message,"content":base64.b64encode(file_bytes).decode(),"branch":branch}
-    sha=getsha()
-    if sha: payload["sha"]=sha
-    r=requests.put(url,headers=hdr,json=payload,timeout=30)
+def github_get_file_sha(owner_repo: str, path: str, branch: str, token: str):
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"} if token else {}
+    params = {"ref": branch}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 200:
+        return r.json().get("sha")
+    return None
+
+def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_bytes: bytes, message: str):
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"} if token else {}
+    content_b64 = base64.b64encode(file_bytes).decode("utf-8")
+    sha = github_get_file_sha(owner_repo, path, branch, token)
+    payload = {"message": message, "content": content_b64, "branch": branch}
+    if sha: payload["sha"] = sha
+    r = requests.put(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
 
-def robust_leaderboard(sheets):
-    frames=[]
-    for name,df in (sheets or {}).items():
-        if not isinstance(df,pd.DataFrame): continue
-        n=str(name).lower()
-        if not (n.startswith("event_") and n.endswith("_standings")): continue
-        if df.empty: continue
-        cols={re.sub(r'[^a-z0-9]','',c.lower()):c for c in df.columns}
-        pcol=cols.get("player") or cols.get("name")
-        plc=cols.get("place") or cols.get("rank") or cols.get("finish") or cols.get("position")
-        kos=cols.get("kos") or cols.get("knockouts") or cols.get("eliminations") or cols.get("elims")
-        if not (pcol and plc): continue
-        t=pd.DataFrame()
-        t["Player"]=df[pcol].astype(str).str.strip()
-        t["Place"]=pd.to_numeric(df[plc],errors="coerce")
-        t["KOs"]=pd.to_numeric(df[kos],errors="coerce").fillna(0).astype(int) if kos else 0
-        t=t.dropna(subset=["Place"])
-        t["Points"]=t["Place"].map(POINTS).fillna(0)
-        frames.append(t)
-    if not frames: return pd.DataFrame(columns=["Player","Total Points","Total KOs","Events Played"])
-    allv=pd.concat(frames,ignore_index=True)
-    g=(allv.groupby("Player",as_index=False)
-        .agg(Total_Points=("Points","sum"),Total_KOs=("KOs","sum"),Events_Played=("Points","count"))
-        .sort_values(["Total_Points","Total_KOs"],ascending=[False,False]).reset_index(drop=True))
-    g.index=g.index+1
-    return g
+def github_test(owner_repo: str, branch: str, token: str):
+    if not owner_repo or "/" not in owner_repo: return False, "Owner/Repo is blank or malformed. Expected 'owner/repo'."
+    if not branch: return False, "Branch is blank."
+    r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
+    if r.status_code == 404: return False, "Repository not found (check owner/repo spelling and token access)."
+    if r.status_code in (401,403): return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
+    r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
+    if r2.status_code == 404: return False, f"Branch '{branch}' not found."
+    if r2.status_code in (401,403): return False, "Branch access denied. Token lacks permissions."
+    # Write test
+    url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
+    payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
+    r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
+    if r3.status_code in (200,201):
+        try:
+            sha = r3.json().get("content",{}).get("sha")
+            if sha:
+                requests.delete(url, headers={"Authorization": f"token {token}"} if token else {}, json={"message":"cleanup","sha":sha,"branch":branch}, timeout=20)
+        except Exception: pass
+        return True, "Connection OK. Repo, branch, and write permission verified."
+    if r3.status_code == 404: return False, "Write failed (404). Repo/branch path not reachable with this token."
+    if r3.status_code == 401: return False, "Unauthorized (401). Token missing or invalid."
+    if r3.status_code == 403: return False, "Forbidden (403). Token lacks 'repo' scope or SSO not authorized."
+    return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
 
 def show_logo(st, primary="league_logo.jpg", fallback="league_logo.png"):
-    # Do not ship any placeholder; just try to render if present
-    try: st.image(primary, use_column_width=True)
+    try:
+        st.image(primary, use_column_width=True)
     except Exception:
         try: st.image(fallback, use_column_width=True)
         except Exception: st.markdown("### Mark & Rose's WSOP League")
 
-import streamlit as st, pandas as pd, re, json, time, requests
-from datetime import datetime, date
 
 st.set_page_config(page_title="WSOP League — Admin", page_icon="🛠️", layout="wide")
 
-# Persisted Player URL
-CFG_PATH = ".wsop_config.json"
-def read_cfg():
-    try:
-        with open(CFG_PATH,"r") as f: return json.load(f)
-    except: return {}
-def write_cfg(d):
-    with open(CFG_PATH,"w") as f: json.dump(d,f,indent=2)
-cfg=read_cfg()
-player_url=cfg.get("player_home_url","")
+col_logo, col_title = st.columns([1,4])
+with col_logo: show_logo(st)
+with col_title:
+    st.markdown("### Mark & Rose's WSOP League — Admin")
+    st.caption("Upload tracker, manage High Hand, Opt-Ins, Buy-Ins, Ledger, and publish to Player Home.")
 
-col1,col2 = st.columns([1,4])
-with col1: show_logo(st)
-with col2: st.markdown("### Mark & Rose's WSOP League — Admin")
+st.divider()
 
+# --- Player Home URL persistence --------------------
 st.sidebar.header("Player Home Refresh")
-player_url = st.sidebar.text_input("Player Home URL (persisted)", value=player_url, placeholder="https://<your-player-app>")
-if st.sidebar.button("Save Player URL to repo"):
-    cfg["player_home_url"]=player_url; write_cfg(cfg); st.sidebar.success("Saved")
-if player_url:
-    st.sidebar.write("Saved URL:"); st.sidebar.code(player_url)
-    if st.sidebar.button("Test Player URL (open)"): st.sidebar.markdown(f"[Open Player Home]({player_url})")
-    if st.sidebar.button("Send refresh ping now"):
+cfg_path = Path(".wsop_config.json")
+cfg = {}
+try:
+    if cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text())
+except Exception:
+    cfg = {}
+player_url = st.sidebar.text_input("Player Home URL", value=cfg.get("player_home_url",""))
+col_a, col_b, col_c = st.sidebar.columns([1,1,1])
+with col_a:
+    if st.button("Save Player URL to repo"):
+        cfg["player_home_url"] = player_url
+        Path(".wsop_config.json").write_text(json.dumps(cfg, indent=2))
+        st.success("Saved URL locally. Publish code to persist in repo.")
+with col_b:
+    if player_url:
+        st.link_button("Test Player URL (open)", player_url, use_container_width=True)
+with col_c:
+    if player_url and st.button("Send refresh ping now"):
         try:
-            ts=int(time.time()); url=f"{player_url.rstrip('/')}/?refresh={ts}"
-            r=requests.get(url,timeout=5)
-            st.sidebar.success(f"Ping {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} (HTTP {r.status_code})")
+            import requests, time as _t
+            r = requests.get(player_url, params={"refresh": int(_t.time())}, timeout=10)
+            st.success(f"Ping sent ({r.status_code}). Last refresh: {pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
         except Exception as e:
-            st.sidebar.warning(f"Ping failed: {e}")
-
-st.sidebar.markdown("---")
-st.sidebar.header("Publish to Player Home (GitHub)")
-owner_repo = st.sidebar.text_input("GitHub repo", value="mmartuko15/wsop-league-app")
-branch = st.sidebar.text_input("Branch", value="main")
-gh_token = st.secrets.get("GITHUB_TOKEN","")
-if not gh_token: gh_token = st.sidebar.text_input("GitHub token (repo)", type="password")
+            st.error(f"Ping failed: {e}")
 
 st.sidebar.markdown("---")
 st.sidebar.header("Data Source")
 default_map, default_bytes = read_local_tracker()
-up = st.sidebar.file_uploader("Upload Tracker (.xlsx)", type=["xlsx"])
-if up is not None:
-    tracker_bytes = up.read(); sheets = read_tracker_bytes(tracker_bytes)
+uploaded_tracker = st.sidebar.file_uploader("Upload Tracker (.xlsx)", type=["xlsx"], key="tracker_admin")
+if uploaded_tracker is not None:
+    tracker_bytes = uploaded_tracker.read(); sheet_map = read_tracker_bytes(tracker_bytes)
 elif default_map is not None:
-    st.sidebar.info("Using repo default: tracker.xlsx"); sheets = default_map; tracker_bytes = default_bytes
+    st.sidebar.info("Using repo default: tracker.xlsx")
+    sheet_map = default_map; tracker_bytes = default_bytes
 else:
-    st.info("Upload tracker.xlsx or add it to the repo."); st.stop()
+    st.info("Upload your tracker .xlsx in the sidebar or add tracker.xlsx to the repo root."); st.stop()
 
-# High Hand last updated
-hh = sheets.get("HighHand_Info", pd.DataFrame())
-if not hh.empty and "Last Updated" in hh.columns:
-    try: st.caption(f"High Hand last updated: {str(hh['Last Updated'].iloc[0])}")
-    except: pass
+st.sidebar.header("Publish to Player Home")
+owner_repo = st.sidebar.text_input("GitHub repo (owner/repo)", value="mmartuko15/wsop-league-app")
+branch = st.sidebar.text_input("Branch", value="main")
+gh_token = st.secrets.get("GITHUB_TOKEN", "") or st.sidebar.text_input("GitHub token (repo scope)", type="password")
 
-# KPIs
-pools = sheets.get("Pools_Ledger", pd.DataFrame())
-st.columns(5)[0].metric("WSOP Pool", f"${pools_balance_robust(pools,'WSOP'):,.2f}")
-st.columns(5)[1].metric("Seat Value (each of 5)", f"${(pools_balance_robust(pools,'WSOP')/5 if pools is not None else 0):,.2f}")
-st.columns(5)[2].metric("Bounty Pool (live)", f"${pools_balance_robust(pools,'Bounty'):,.2f}")
-st.columns(5)[3].metric("High Hand (live)", f"${pools_balance_robust(pools,'High Hand'):,.2f}")
-st.columns(5)[4].metric("Nightly Pool (post-payout)", f"${pools_balance_robust(pools,'Nightly'):,.2f}")
+if st.sidebar.button("Test GitHub connection"):
+    ok, msg = github_test(owner_repo, branch, gh_token); (st.sidebar.success if ok else st.sidebar.error)(msg)
 
-tabs = st.tabs(["Leaderboard","High Hand (Admin)","Pools Ledger","Download/Publish"])
+pools = sheet_map.get("Pools_Ledger", pd.DataFrame())
+wsop_total = pools_balance_robust(pools,"WSOP")
+bounty_total = pools_balance_robust(pools,"Bounty")
+highhand_total = pools_balance_robust(pools,"High Hand")
+nightly_total = pools_balance_robust(pools,"Nightly")
+k1,k2,k3,k4,k5 = st.columns(5)
+k1.metric("WSOP Pool", f"${wsop_total:,.2f}")
+k2.metric("Seat Value (each of 5)", f"${(wsop_total/5 if wsop_total else 0):,.2f}")
+k3.metric("Bounty Pool (live)", f"${bounty_total:,.2f}")
+k4.metric("High Hand (live)", f"${highhand_total:,.2f}")
+k5.metric("Nightly Pool (post-payout)", f"${nightly_total:,.2f}")
 
-with tabs[0]:
-    st.dataframe(robust_leaderboard(sheets), use_container_width=True)
+tabs = st.tabs(["Leaderboard","Events","Add New Event","Opt-Ins","High Hand (Admin)","Buy-Ins","Player Finances","Pools Ledger","Supplies","Download/Publish"])
 
-with tabs[1]:
-    st.subheader("High Hand (Admin)")
-    df = sheets.get("HighHand_Info", pd.DataFrame(columns=["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"])).copy()
-    if df.empty: df.loc[0]=["","","","",""]
-    holder = st.text_input("Current Holder", value=str(df.at[0,"Current Holder"] or ""))
-    hand = st.text_input("Hand Description", value=str(df.at[0,"Hand Description"] or ""))
-    override = st.text_input("Display Value (override)", value=str(df.at[0,"Display Value (override)"] or ""))
-    note = st.text_area("Note", value=str(df.at[0,"Note"] or ""))
+with tabs[4]:
+    st.subheader("High Hand Controls")
+    hh = sheet_map.get("HighHand_Info", pd.DataFrame(columns=["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"])).copy()
+    if hh.empty: hh.loc[0] = ["","", "", "", ""]
+    holder = st.text_input("Current Holder", value=str(hh.at[0,"Current Holder"] or ""))
+    hand = st.text_input("Hand Description", value=str(hh.at[0,"Hand Description"] or ""))
+    value_override = st.text_input("Display Value (override)", value=str(hh.at[0,"Display Value (override)"] or ""))
+    note = st.text_area("Note", value=str(hh.at[0,"Note"] or ""))
     if st.button("Save High Hand Info"):
-        df.at[0,"Current Holder"]=(holder or "").strip()
-        df.at[0,"Hand Description"]=(hand or "").strip()
-        df.at[0,"Display Value (override)"]=(override or "").strip()
-        df.at[0,"Last Updated"]=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        df.at[0,"Note"]=(note or "").strip()
-        sheets["HighHand_Info"]=df
-        st.success("Saved High Hand info.")
-        st.caption(f"Last Updated now: {df.at[0,'Last Updated']}")
+        hh.at[0,"Current Holder"] = (holder or "").strip()
+        hh.at[0,"Hand Description"] = (hand or "").strip()
+        hh.at[0,"Display Value (override)"] = (value_override or "").strip()
+        hh.at[0,"Last Updated"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        hh.at[0,"Note"] = (note or "").strip()
+        sheet_map["HighHand_Info"] = hh
+        st.success(f"Saved High Hand info.  \n**Last Updated now:** {hh.at[0,'Last Updated']}")
+    st.markdown("**Preview to be written:**")
+    st.dataframe(hh, use_container_width=True)
 
-with tabs[2]:
-    st.dataframe(pools, use_container_width=True)
-
-with tabs[3]:
+with tabs[9]:
     st.subheader("Export your changes")
-    import io
-    with pd.ExcelWriter("updated_tracker.xlsx", engine="openpyxl") as w:
-        for name,df in sheets.items():
-            df.to_excel(w, sheet_name=str(name)[:31], index=False)
-    with open("updated_tracker.xlsx","rb") as f: updated = f.read()
-    st.download_button("Download updated tracker (.xlsx)", data=updated, file_name="tracker.xlsx")
-
+    with pd.ExcelWriter("updated_tracker.xlsx", engine="openpyxl") as writer:
+        for name, df in sheet_map.items():
+            df.to_excel(writer, sheet_name=str(name)[:31], index=False)
+    with open("updated_tracker.xlsx","rb") as f: updated_bytes = f.read()
+    st.download_button("Download updated tracker (.xlsx)", data=updated_bytes, file_name="tracker.xlsx")
     st.markdown("---")
     st.subheader("Publish to Player Home (GitHub)")
     if st.button("Publish tracker.xlsx to GitHub"):
         if not owner_repo or not branch or not gh_token:
             st.error("Provide repo, branch, and GITHUB_TOKEN secret.")
         else:
-            code, resp = github_put(owner_repo, "tracker.xlsx", branch, gh_token, updated, "Update tracker.xlsx from Admin (v1.8.8f)")
-            if code in (200,201):
-                st.success("Published to GitHub.")
+            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin (v1.8.8g)")
+            if status in (200,201):
+                # Try to parse SHA from response
+                sha = ""
+                try:
+                    data = json.loads(text)
+                    sha = data.get("content",{}).get("sha","")
+                except Exception: pass
+                st.success(f"Published to GitHub. Commit SHA: {sha[:7] if sha else '—'}")
                 if player_url:
-                    import time
-                    ts=int(time.time())
-                    link=f"{player_url.rstrip('/')}/?refresh={ts}"
-                    st.markdown(f"**Open Player Home (refresh)** → [{link}]({link})")
+                    st.link_button("Open Player Home (refresh)", player_url + f"?refresh={int(pd.Timestamp.utcnow().timestamp())}", use_container_width=True)
             else:
-                st.error(f"GitHub API: {code} — {resp}")
+                st.error(f"GitHub API response: {status} — {text}")
