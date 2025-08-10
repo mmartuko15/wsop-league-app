@@ -3,7 +3,7 @@ import streamlit as st, pandas as pd, base64, re
 from io import BytesIO
 from pathlib import Path
 
-import base64, requests, pandas as pd, re
+import base64, requests, pandas as pd, re, io
 from io import BytesIO
 from PIL import Image
 
@@ -16,12 +16,25 @@ def parse_money(x):
     try: return float(s)
     except: return 0.0
 
-def pools_balance(pools_df, pool):
-    if pools_df is None or pools_df.empty: return 0.0
-    d = pools_df[pools_df["Pool"]==pool].copy()
-    if d.empty: return 0.0
-    sign = d["Type"].map({"Accrual":1,"Payout":-1}).fillna(1)
-    return float((d["Amount"]*sign).sum())
+def pools_balance_robust(pools_df, pool_name):
+    """Case-insensitive, parses currency, Accrual=+, Payout=-"""
+    if pools_df is None or len(pools_df)==0:
+        return 0.0
+    df = pools_df.copy()
+    # normalize headers
+    norm = {c: re.sub(r'[^a-z0-9]', '', str(c).lower()) for c in df.columns}
+    df.columns = [norm[c] for c in df.columns]
+    # map essential columns
+    tcol = next((c for c in df.columns if c in ("type","entrytype")), None)
+    pcol = next((c for c in df.columns if c in ("pool","fund")), None)
+    acol = next((c for c in df.columns if c in ("amount","amt","value")), None)
+    if not (tcol and pcol and acol):
+        return 0.0
+    df[acol] = df[acol].apply(parse_money)
+    df[pcol] = df[pcol].astype(str).str.strip().str.lower()
+    sign = df[tcol].astype(str).str.strip().str.lower().map({"accrual":1,"payout":-1}).fillna(1)
+    sub = df[df[pcol] == str(pool_name).strip().lower()]
+    return float((sub[acol] * sign.loc[sub.index]).sum())
 
 def read_tracker_bytes(file_bytes: bytes) -> dict:
     return pd.read_excel(BytesIO(file_bytes), sheet_name=None, engine="openpyxl")
@@ -54,17 +67,18 @@ def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_by
     r = requests.put(url, headers=headers, json=payload, timeout=30)
     return r.status_code, r.text
 
-def show_logo(st, path: str, fallback_title: str = ""):
-    """Safely render a logo; fall back to text if file missing/invalid."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        # Validate image
-        Image.open(BytesIO(data))
-        st.image(path, use_column_width=True)
-    except Exception:
-        if fallback_title:
-            st.markdown(f"**{fallback_title}**")
+def show_logo(st, primary="league_logo.jpg", secondary="league_logo.png"):
+    """Attempt to display JPG then PNG; fallback to text if invalid/missing."""
+    for path in (primary, secondary):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            Image.open(io.BytesIO(data))  # validate
+            st.image(data, use_column_width=True)
+            return
+        except Exception:
+            continue
+    st.write("### Mark & Rose's WSOP League")
 
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
@@ -131,15 +145,17 @@ def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
 
 st.set_page_config(page_title="WSOP League — Admin", page_icon="🛠️", layout="wide")
 
+# Header
 col_logo, col_title = st.columns([1,4])
 with col_logo:
-    show_logo(st, "league_logo.png", "WSOP League — Admin")
+    show_logo(st)  # prefers JPG, then PNG, fallback text
 with col_title:
     st.markdown("### Mark & Rose's WSOP League — Admin")
     st.caption("Upload tracker, ingest events, manage Second Chance opt-ins, High Hand, and Buy-Ins.")
 
 st.divider()
 
+# Sidebar: data source
 st.sidebar.header("Data Source")
 default_map, default_bytes = read_local_tracker()
 uploaded_tracker = st.sidebar.file_uploader("Upload Tracker (.xlsx)", type=["xlsx"], key="tracker_admin")
@@ -155,6 +171,7 @@ else:
     st.info("Upload your tracker .xlsx in the sidebar or add tracker.xlsx to the repo root.")
     st.stop()
 
+# Sidebar: GitHub publish settings
 st.sidebar.header("Publish to Player Home")
 owner_repo = st.sidebar.text_input("GitHub repo (owner/repo)", value="youruser/wsop-league-app")
 branch = st.sidebar.text_input("Branch", value="main")
@@ -162,11 +179,12 @@ gh_token = st.secrets.get("GITHUB_TOKEN", "")
 if not gh_token:
     gh_token = st.sidebar.text_input("GitHub token (repo scope)", type="password")
 
+# KPIs using robust pools
 pools = sheet_map.get("Pools_Ledger", pd.DataFrame())
-wsop_total = pools_balance(pools,"WSOP")
-bounty_total = pools_balance(pools,"Bounty")
-highhand_total = pools_balance(pools,"High Hand")
-nightly_total = pools_balance(pools,"Nightly")
+wsop_total = pools_balance_robust(pools,"WSOP")
+bounty_total = pools_balance_robust(pools,"Bounty")
+highhand_total = pools_balance_robust(pools,"High Hand")
+nightly_total = pools_balance_robust(pools,"Nightly")
 
 k1,k2,k3,k4,k5 = st.columns(5)
 k1.metric("WSOP Pool", f"${wsop_total:,.2f}")
@@ -175,8 +193,10 @@ k3.metric("Bounty Pool (live)", f"${bounty_total:,.2f}")
 k4.metric("High Hand (live)", f"${highhand_total:,.2f}")
 k5.metric("Nightly Pool (post-payout)", f"${nightly_total:,.2f}")
 
+# Tabs
 tabs = st.tabs(["Leaderboard","Events","Add New Event from Timer Log","Opt-Ins (Admin)","High Hand (Admin)","Buy-Ins (Admin)","Player Finances","Pools Ledger","Supplies","Download/Publish"])
 
+# Leaderboard (robust)
 with tabs[0]:
     lb = robust_leaderboard(sheet_map)
     if lb.empty:
@@ -184,9 +204,11 @@ with tabs[0]:
     else:
         st.dataframe(lb, use_container_width=True)
 
+# Events
 with tabs[1]:
     st.dataframe(sheet_map.get("Events", pd.DataFrame()), use_container_width=True)
 
+# Add New Event from Timer Log
 with tabs[2]:
     st.subheader("Upload the timer's event log (HTML/CSV export)")
     new_log = st.file_uploader("Timer Log Export", type=["html","csv","txt"], key="newlog_admin")
@@ -227,17 +249,20 @@ with tabs[2]:
                 standings.loc[widx[0],"Bounty $ (KOs*5)"] += 5
             standings["Payout_Amount"] = standings["Payout"].apply(parse_money)
 
+            # Next event #
             ev_nums = [int(n.split("_")[1]) for n in sheet_map.keys() if str(n).startswith("Event_") and str(n).endswith("_Standings")]
             ev_next = (max(ev_nums)+1) if ev_nums else 1
 
             events_df = sheet_map.get("Events", pd.DataFrame())
             e_date = str(events_df[events_df["Event #"]==ev_next]["Date"].iloc[0]) if not events_df.empty and not events_df[events_df["Event #"]==ev_next].empty else "2025-01-01"
 
+            # Players list from BuyIn row
             rpn = n(rp)
             players_field = rpn.get("players") or list(rp.columns)[0]
             players_list = [p.strip() for p in str(rp.iloc[0][players_field]).split(",") if p.strip()]
             n_players = len(players_list)
 
+            # Auto-add new players
             players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player","Initial Buy-In Paid","Active"])).copy()
             existing = set(players_sheet["Player"]) if not players_sheet.empty else set()
             for p in players_list:
@@ -246,6 +271,7 @@ with tabs[2]:
                     players_sheet = pd.concat([players_sheet, pd.DataFrame([new_row])], ignore_index=True)
             sheet_map["Players"] = players_sheet
 
+            # Pools ledger
             pools = sheet_map.get("Pools_Ledger", pd.DataFrame(columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])).copy()
             accruals = pd.DataFrame([
                 [e_date, ev_next, "Accrual","WSOP",    200*n_players, "", "Initial buy-ins ($200 x players)"],
@@ -258,6 +284,7 @@ with tabs[2]:
             pools = pd.concat([pools, accruals], ignore_index=True)
             sheet_map["Pools_Ledger"] = pools
 
+            # Supplies: ensure $100 tip
             supplies = sheet_map.get("Supplies", pd.DataFrame(columns=["Event #","Date","Item","Amount","Notes"])).copy()
             mask = (supplies["Event #"]==ev_next) & (supplies["Item"]=="Server Tip")
             if supplies[mask].empty:
@@ -265,11 +292,14 @@ with tabs[2]:
                 supplies = pd.concat([supplies, tip_row], ignore_index=True)
             sheet_map["Supplies"] = supplies
 
+            # Save standings
             sheet_map[f"Event_{ev_next}_Standings"] = standings
+
             st.success(f"Ingested event #{ev_next}. Use 'Download/Publish' to export.")
         except Exception as e:
             st.error(f"Could not add event: {e}")
 
+# Opt-Ins (Admin)
 with tabs[3]:
     st.subheader("Second Chance Opt-Ins (Events 8–12)")
     players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
@@ -285,6 +315,7 @@ with tabs[3]:
         sheet_map["SecondChance_OptIns"] = current_optins.sort_values(["Event #","Player"]).reset_index(drop=True)
         st.success("Saved opt-ins.")
 
+# High Hand (Admin)
 with tabs[4]:
     st.subheader("High Hand Controls")
     hh = sheet_map.get("HighHand_Info", pd.DataFrame(columns=["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"])).copy()
@@ -303,6 +334,7 @@ with tabs[4]:
         sheet_map["HighHand_Info"] = hh
         st.success("High Hand info saved.")
 
+# Buy-Ins (Admin)
 with tabs[5]:
     st.subheader("Record Series Buy-Ins ($200)")
     players_sheet = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
@@ -326,6 +358,7 @@ with tabs[5]:
     st.markdown("#### Current Buy-Ins")
     st.dataframe(ledger, use_container_width=True)
 
+# Player Finances (Admin view)
 with tabs[6]:
     st.subheader("Per-Player Finances")
     def build_financials(sheet_map):
@@ -377,12 +410,15 @@ with tabs[6]:
     fin = build_financials(sheet_map)
     st.dataframe(fin, use_container_width=True)
 
+# Pools Ledger
 with tabs[7]:
     st.dataframe(sheet_map.get("Pools_Ledger", pd.DataFrame()), use_container_width=True)
 
+# Supplies
 with tabs[8]:
     st.dataframe(sheet_map.get("Supplies", pd.DataFrame()), use_container_width=True)
 
+# Download / Publish
 with tabs[9]:
     st.subheader("Export your changes")
     with pd.ExcelWriter("updated_tracker.xlsx", engine="openpyxl") as writer:
