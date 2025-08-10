@@ -50,6 +50,15 @@ def read_local_tracker():
     except Exception:
         return (None, None)
 
+def github_get_file(owner_repo: str, branch: str, token: str, path: str="tracker.xlsx") -> bytes:
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"} if token else {}
+    params = {"ref": branch}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    import base64 as _b
+    return _b.b64decode(r.json()["content"])
+
 def github_get_file_sha(owner_repo: str, path: str, branch: str, token: str):
     url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
     headers = {"Authorization": f"token {token}"} if token else {}
@@ -85,6 +94,7 @@ def github_test(owner_repo: str, branch: str, token: str):
         return False, f"Branch '{branch}' not found."
     if r2.status_code in (401,403):
         return False, "Branch access denied. Token lacks permissions."
+    # Write test
     url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
     payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
     r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
