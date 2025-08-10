@@ -48,6 +48,60 @@ def read_local_tracker():
     except Exception:
         return (None, None)
 
+def github_get_file_sha(owner_repo: str, path: str, branch: str, token: str):
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"} if token else {}
+    params = {"ref": branch}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 200:
+        return r.json().get("sha")
+    return None
+
+def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_bytes: bytes, message: str):
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
+    headers = {"Authorization": f"token {token}"} if token else {}
+    content_b64 = base64.b64encode(file_bytes).decode("utf-8")
+    sha = github_get_file_sha(owner_repo, path, branch, token)
+    payload = {"message": message, "content": content_b64, "branch": branch}
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=headers, json=payload, timeout=30)
+    return r.status_code, r.text
+
+def github_test(owner_repo: str, branch: str, token: str):
+    if not owner_repo or "/" not in owner_repo:
+        return False, "Owner/Repo is blank or malformed. Expected 'owner/repo'."
+    if not branch:
+        return False, "Branch is blank."
+    r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
+    if r.status_code == 404:
+        return False, "Repository not found (check owner/repo spelling and that your token can see it)."
+    if r.status_code in (401,403):
+        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
+    r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
+    if r2.status_code == 404:
+        return False, f"Branch '{branch}' not found."
+    if r2.status_code in (401,403):
+        return False, "Branch access denied. Token lacks permissions."
+    url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
+    payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
+    r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
+    if r3.status_code in (200,201):
+        try:
+            sha = r3.json().get("content",{}).get("sha")
+            if sha:
+                requests.delete(url, headers={"Authorization": f"token {token}"} if token else {}, json={"message":"cleanup","sha":sha,"branch":branch}, timeout=20)
+        except Exception:
+            pass
+        return True, "Connection OK. Repo, branch, and write permission verified."
+    if r3.status_code == 404:
+        return False, "Write failed with 404. Repo/branch path not reachable with this token."
+    if r3.status_code == 401:
+        return False, "Unauthorized (401). Token missing or invalid."
+    if r3.status_code == 403:
+        return False, "Forbidden (403). Token lacks 'repo' scope or SSO not authorized."
+    return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
+
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     def norm_cols(df):
         mapping = {}
@@ -131,21 +185,12 @@ if sheet_map is None:
     st.info("Waiting for tracker.xlsx to be present in the repo (or upload one).")
     st.stop()
 
-# Banner shows source + High Hand last updated
-def clean_str(x):
-    if x is None: return ""
-    try:
-        if pd.isna(x): return ""
-    except Exception:
-        pass
-    s = str(x).strip()
-    return "" if s.lower()=="nan" else s
-
+# High Hand data-source banner
 last_updated = ""
 hh = sheet_map.get("HighHand_Info", pd.DataFrame())
 if not hh.empty and "Last Updated" in hh.columns:
     try:
-        last_updated = clean_str(hh["Last Updated"].iloc[0])
+        last_updated = str(hh["Last Updated"].iloc[0])
     except Exception:
         last_updated = ""
 st.info(f"**Data source:** {source_label}" + (f"  •  **High Hand last updated:** {last_updated}" if last_updated else ""))
@@ -226,27 +271,35 @@ with tabs[3]:
     st.caption("Winner keeps their own $5 bounty; pool pays at final event.")
 
 with tabs[4]:
+    # Robust High Hand render: treat NaN/blank as empty; handle override
+    hh = sheet_map.get("HighHand_Info", pd.DataFrame())
     holder = hand_desc = override_val = ""
-    if "HighHand_Info" in sheet_map and not sheet_map["HighHand_Info"].empty:
-        hh = sheet_map["HighHand_Info"]
-        holder = clean_str(hh.get("Current Holder", [""]).iloc[0] if "Current Holder" in hh.columns else "")
-        hand_desc = clean_str(hh.get("Hand Description", [""]).iloc[0] if "Hand Description" in hh.columns else "")
-        override_val = clean_str(hh.get("Display Value (override)", [""]).iloc[0] if "Display Value (override)" in hh.columns else "")
+    if not hh.empty:
+        def clean_get(col):
+            try:
+                v = hh.get(col, [""]).iloc[0]
+                return "" if (pd.isna(v) or str(v).strip().lower()=="nan") else str(v).strip()
+            except Exception:
+                return ""
+        holder = clean_get("Current Holder")
+        hand_desc = clean_get("Hand Description")
+        override_val = clean_get("Display Value (override)")
 
-    # Format override if numeric; otherwise show as-is; if empty, use live pool
-    jackpot_display = ""
-    if override_val:
-        try:
-            v = float(str(override_val).replace("$","").replace(",",""))
-            jackpot_display = f"${v:,.2f}"
-        except Exception:
-            jackpot_display = override_val
+    # determine display amount
+    amt = override_val
+    if amt == "":
+        amt = f"${highhand_total:,.2f}"
     else:
-        jackpot_display = f"${highhand_total:,.2f}"
+        # if numeric-like, format
+        try:
+            val = float(str(amt).replace("$","").replace(",",""))
+            amt = f"${val:,.2f}"
+        except:
+            pass
 
     st.write(f"**Current Holder:** {holder if holder else '—'}")
     st.write(f"**Hand:** {hand_desc if hand_desc else '—'}")
-    st.write(f"**Jackpot Value:** {jackpot_display}")
+    st.write(f"**Jackpot Value:** {amt}")
 
 with tabs[5]:
     optins = sheet_map.get("SecondChance_OptIns", pd.DataFrame())

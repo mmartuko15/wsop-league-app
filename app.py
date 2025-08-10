@@ -315,21 +315,31 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("High Hand Controls")
+    # Read existing or seed an empty row with clean strings (no NaN)
     hh = sheet_map.get("HighHand_Info", pd.DataFrame(columns=["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"])).copy()
     if hh.empty:
-        hh.loc[0] = ["","", "", "", ""]
+        hh.loc[0] = ["","","","", ""]
+    else:
+        # Normalize any NaN to empty strings
+        for col in ["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"]:
+            if col in hh.columns:
+                hh[col] = hh[col].apply(lambda v: "" if (pd.isna(v) or str(v).strip().lower()=="nan") else str(v))
+
     holder = st.text_input("Current Holder", value=str(hh.at[0,"Current Holder"]))
     hand = st.text_input("Hand Description", value=str(hh.at[0,"Hand Description"]))
     value_override = st.text_input("Display Value (override)", value=str(hh.at[0,"Display Value (override)"]))
     note = st.text_area("Note", value=str(hh.at[0,"Note"]))
+
     if st.button("Save High Hand Info"):
-        hh.at[0,"Current Holder"] = holder
-        hh.at[0,"Hand Description"] = hand
-        hh.at[0,"Display Value (override)"] = value_override
+        def clean(s): 
+            return "" if (s is None or str(s).strip().lower()=="nan") else str(s).strip()
+        hh.at[0,"Current Holder"] = clean(holder)
+        hh.at[0,"Hand Description"] = clean(hand)
+        hh.at[0,"Display Value (override)"] = clean(value_override)
         hh.at[0,"Last Updated"] = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        hh.at[0,"Note"] = note
-        sheet_map["HighHand_Info"] = hh
-        st.success("High Hand info saved.")
+        hh.at[0,"Note"] = clean(note)
+        sheet_map["HighHand_Info"] = hh[["Current Holder","Hand Description","Display Value (override)","Last Updated","Note"]]
+        st.success("High Hand info saved (cleaned).")
 
 with tabs[5]:
     st.subheader("Record Series Buy-Ins ($200)")
@@ -487,7 +497,7 @@ with tabs[9]:
         if not owner_repo or not branch or not gh_token:
             st.error("Provide repo (owner/repo), branch, and GITHUB_TOKEN secret.")
         else:
-            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.8.8)")
+            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.8.8b)")
             if status in (200,201):
                 st.success("Published to GitHub. Player Home will update automatically.")
             else:
