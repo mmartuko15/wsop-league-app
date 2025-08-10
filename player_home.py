@@ -1,5 +1,5 @@
 
-import streamlit as st, pandas as pd, re, base64, requests
+import streamlit as st, pandas as pd, re
 from io import BytesIO
 
 import base64, requests, pandas as pd, re
@@ -48,15 +48,6 @@ def read_local_tracker():
     except Exception:
         return (None, None)
 
-def github_get_file(owner_repo: str, branch: str, token: str, path: str="tracker.xlsx") -> bytes:
-    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}"} if token else {}
-    params = {"ref": branch}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    import base64 as _b
-    return _b.b64decode(r.json()["content"])
-
 def github_get_file_sha(owner_repo: str, path: str, branch: str, token: str):
     url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
     headers = {"Authorization": f"token {token}"} if token else {}
@@ -92,7 +83,6 @@ def github_test(owner_repo: str, branch: str, token: str):
         return False, f"Branch '{branch}' not found."
     if r2.status_code in (401,403):
         return False, "Branch access denied. Token lacks permissions."
-    # Write test
     url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
     payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
     r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
@@ -175,64 +165,35 @@ with col_title:
 
 st.divider()
 
-# Sidebar: Auto-fetch toggle
-st.sidebar.header("Data source")
-auto_fetch = st.sidebar.checkbox("Auto-fetch from GitHub on load", value=True)
-owner_repo = st.sidebar.text_input("Owner/Repo", value="mmartuko15/wsop-league-app")
-branch = st.sidebar.text_input("Branch", value="main")
+# Only Repo file (bundled) or Upload override
+default_map, _ = read_local_tracker()
+mode = st.sidebar.radio("Load tracker from", ["Repo file (default)", "Upload file"], index=0)
 
-sheet_map = None
-source_label = ""
-last_updated = ""
-
-def do_fetch():
-    token = st.secrets.get("PLAYER_GITHUB_TOKEN", "")
-    if not token:
-        token = st.sidebar.text_input("GitHub token (read-only)", type="password", key="player_token")
-    try:
-        bytes_ = github_get_file(owner_repo, branch, token, path="tracker.xlsx")
-        return read_tracker_bytes(bytes_)
-    except Exception as e:
-        st.sidebar.error(f"GitHub fetch failed: {e}")
-        return None
-
-if auto_fetch:
-    fetched = do_fetch()
-    if fetched is not None:
-        sheet_map = fetched
-        source_label = f"GitHub API — {owner_repo}@{branch}"
+if mode == "Upload file":
+    uploaded = st.sidebar.file_uploader("Upload tracker (.xlsx)", type=["xlsx"])
+    if uploaded:
+        sheet_map = read_tracker_bytes(uploaded.read())
+        source_label = "Uploaded file"
     else:
-        st.sidebar.warning("Falling back to repo file / upload because auto-fetch failed.")
+        st.info("No file uploaded. Using repo file instead.")
+        sheet_map = default_map
+        source_label = "Repo file (bundled)"
+else:
+    sheet_map = default_map
+    source_label = "Repo file (bundled)"
 
 if sheet_map is None:
-    mode = st.sidebar.radio("Manual source", ["Repo file (bundled)", "Upload file", "Fetch now"], index=0)
-    if mode == "Upload file":
-        uploaded = st.sidebar.file_uploader("Upload tracker (.xlsx)", type=["xlsx"])
-        if uploaded:
-            sheet_map = read_tracker_bytes(uploaded.read())
-            source_label = "Uploaded file"
-    elif mode == "Fetch now":
-        sheet_map = do_fetch()
-        if sheet_map is not None:
-            source_label = f"GitHub API — {owner_repo}@{branch}"
-    else:
-        default_map, _ = read_local_tracker()
-        if default_map is not None:
-            sheet_map = default_map
-            source_label = "Repo file (bundled)"
-
-if sheet_map is None:
-    st.info("No tracker loaded yet. Choose a data source in the sidebar.")
+    st.info("Waiting for tracker.xlsx to be present in the repo (or upload one).")
     st.stop()
 
-# Banner with last updated
+# Banner shows source + High Hand last updated
+last_updated = ""
 hh = sheet_map.get("HighHand_Info", pd.DataFrame())
 if not hh.empty and "Last Updated" in hh.columns:
     try:
         last_updated = str(hh["Last Updated"].iloc[0])
     except Exception:
         last_updated = ""
-
 st.info(f"**Data source:** {source_label}" + (f"  •  **High Hand last updated:** {last_updated}" if last_updated else ""))
 
 pools = sheet_map.get("Pools_Ledger", pd.DataFrame())

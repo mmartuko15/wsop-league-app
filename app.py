@@ -50,15 +50,6 @@ def read_local_tracker():
     except Exception:
         return (None, None)
 
-def github_get_file(owner_repo: str, branch: str, token: str, path: str="tracker.xlsx") -> bytes:
-    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}"} if token else {}
-    params = {"ref": branch}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    import base64 as _b
-    return _b.b64decode(r.json()["content"])
-
 def github_get_file_sha(owner_repo: str, path: str, branch: str, token: str):
     url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
     headers = {"Authorization": f"token {token}"} if token else {}
@@ -94,7 +85,6 @@ def github_test(owner_repo: str, branch: str, token: str):
         return False, f"Branch '{branch}' not found."
     if r2.status_code in (401,403):
         return False, "Branch access denied. Token lacks permissions."
-    # Write test
     url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
     payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
     r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
@@ -408,4 +398,97 @@ with tabs[6]:
     st.dataframe(fin, use_container_width=True)
 
 with tabs[7]:
-    st.write("Read-only view of league standings and finances.")
+    st.subheader("Pools Ledger")
+    st.dataframe(sheet_map.get("Pools_Ledger", pd.DataFrame()), use_container_width=True)
+    st.markdown("---")
+    st.markdown("#### One-click Sync")
+    pools = sheet_map.get("Pools_Ledger", pd.DataFrame(columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])).copy()
+
+    if st.button("Sync from Series Buy-Ins → WSOP accruals"):
+        buyins = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount","Date"]))
+        add = []
+        for _, r in buyins.iterrows():
+            amt = parse_money(r.get("Amount", 0))
+            if amt == 0: 
+                continue
+            d = str(r.get("Date", "")) or str(date.today())
+            note = f"Series buy-in — {r.get('Player','')}"
+            add.append([d, 0, "Accrual", "WSOP", float(amt), "", note])
+        if add:
+            newdf = pd.DataFrame(add, columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])
+            pools = pd.concat([pools, newdf], ignore_index=True)
+            pools = pools.drop_duplicates(subset=["Date","Event #","Type","Pool","Amount","Note"], keep="first").reset_index(drop=True)
+            sheet_map["Pools_Ledger"] = pools
+            st.success(f"Added {len(add)} WSOP accrual rows from Series_BuyIns.")
+        else:
+            st.info("No buy-ins to sync.")
+
+    if st.button("Backfill Event Accruals/Payouts"):
+        events_df = sheet_map.get("Events", pd.DataFrame())
+        colmap = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in (events_df.columns if not events_df.empty else [])}
+        event_num_col = colmap.get("event")
+        date_col = colmap.get("date")
+
+        ev_sheets = [k for k in sheet_map if str(k).startswith("Event_") and str(k).endswith("_Standings")]
+        add = []
+        for s in ev_sheets:
+            try:
+                ev_num = int(s.split("_")[1])
+            except:
+                continue
+            ev_date = None
+            if not events_df.empty and event_num_col and date_col:
+                try:
+                    ev_date = str(events_df.loc[events_df[event_num_col]==ev_num, date_col].iloc[0])
+                except:
+                    pass
+            if not ev_date:
+                ev_date = str(date.today())
+
+            df = sheet_map[s]
+            cols = {re.sub(r'[^a-z0-9]','', c.lower()): c for c in df.columns}
+            pcol = cols.get("player") or cols.get("name")
+            payout_col = cols.get("payout") or cols.get("payoutamount")
+            if not (pcol and payout_col):
+                continue
+            attendees = int(df[pcol].dropna().shape[0])
+            payout_sum = float(df[payout_col].apply(parse_money).sum())
+            add.extend([
+                [ev_date, ev_num, "Accrual","WSOP",      3*attendees,  "", "WSOP addl funding ($3 x players)"],
+                [ev_date, ev_num, "Accrual","Nightly",  45*attendees, "", "Nightly payout funding ($45 x players)"],
+                [ev_date, ev_num, "Accrual","Bounty",    5*attendees, "", "Bounty pool funding ($5 x players)"],
+                [ev_date, ev_num, "Accrual","High Hand", 2*attendees, "", "High hand funding ($2 x players)"],
+                [ev_date, ev_num, "Payout","Nightly",    payout_sum,  "Yes", "Paid out on event night based on finish order"],
+            ])
+        if add:
+            newdf = pd.DataFrame(add, columns=["Date","Event #","Type","Pool","Amount","Immediate?","Note"])
+            pools = pd.concat([pools, newdf], ignore_index=True)
+            pools = pools.drop_duplicates(subset=["Date","Event #","Type","Pool","Amount","Note"], keep="first").reset_index(drop=True)
+            sheet_map["Pools_Ledger"] = pools
+            st.success(f"Backfilled {len(add)} ledger rows from event sheets.")
+        else:
+            st.info("No event sheets found to backfill.")
+
+with tabs[8]:
+    st.dataframe(sheet_map.get("Supplies", pd.DataFrame()), use_container_width=True)
+
+with tabs[9]:
+    st.subheader("Export your changes")
+    with pd.ExcelWriter("updated_tracker.xlsx", engine="openpyxl") as writer:
+        for name, df in sheet_map.items():
+            df.to_excel(writer, sheet_name=str(name)[:31], index=False)
+    with open("updated_tracker.xlsx","rb") as f:
+        updated_bytes = f.read()
+    st.download_button("Download updated tracker (.xlsx)", data=updated_bytes, file_name="tracker.xlsx")
+
+    st.markdown("---")
+    st.subheader("Publish to Player Home (GitHub)")
+    if st.button("Publish tracker.xlsx to GitHub"):
+        if not owner_repo or not branch or not gh_token:
+            st.error("Provide repo (owner/repo), branch, and GITHUB_TOKEN secret.")
+        else:
+            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.8.8)")
+            if status in (200,201):
+                st.success("Published to GitHub. Player Home will update automatically.")
+            else:
+                st.error(f"GitHub API response: {status} — {text}")
