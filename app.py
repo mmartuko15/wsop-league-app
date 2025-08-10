@@ -71,49 +71,40 @@ def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_by
     return r.status_code, r.text
 
 def github_test(owner_repo: str, branch: str, token: str):
-    """Return (ok: bool, message: str). Checks repo existence, branch, and write permission to tracker.xlsx."""
     if not owner_repo or "/" not in owner_repo:
         return False, "Owner/Repo is blank or malformed. Expected 'owner/repo'."
     if not branch:
         return False, "Branch is blank."
-
-    # 1) Repo exists?
     r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
     if r.status_code == 404:
-        return False, "Repository not found (check owner/repo spelling and that your token can see it)."
-    if r.status_code == 401 or r.status_code == 403:
-        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
-
-    # 2) Branch exists?
+        return False, "Repository not found (check owner/repo spelling and token access)."
+    if r.status_code in (401,403):
+        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO)."
     r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
     if r2.status_code == 404:
         return False, f"Branch '{branch}' not found."
     if r2.status_code in (401,403):
-        return False, f"Branch access denied. Token lacks permissions."
-
-    # 3) Write permission? Try to PUT a tiny test file in memory (dry run target path)
-    import os
+        return False, "Branch access denied. Token lacks permissions."
+    # write test
     test_bytes = b"wsop-league write test"
     url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
     payload = {"message": "write-test", "content": base64.b64encode(test_bytes).decode("utf-8"), "branch": branch}
     r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
     if r3.status_code in (200,201):
-        # cleanup attempt (best-effort)
         try:
             sha = r3.json().get("content",{}).get("sha")
             if sha:
-                requests.delete(url, headers={"Authorization": f"token {token}"} if token else {}, json={"message":"cleanup write-test","sha":sha,"branch":branch}, timeout=20)
+                requests.delete(url, headers={"Authorization": f"token {token}"} if token else {}, json={"message":"cleanup","sha":sha,"branch":branch}, timeout=20)
         except Exception:
             pass
         return True, "Connection OK. Repo, branch, and write permission verified."
-    elif r3.status_code == 404:
+    if r3.status_code == 404:
         return False, "Write failed with 404. Repo/branch path not reachable with this token."
-    elif r3.status_code == 401:
+    if r3.status_code == 401:
         return False, "Unauthorized (401). Token missing or invalid."
-    elif r3.status_code == 403:
+    if r3.status_code == 403:
         return False, "Forbidden (403). Token lacks 'repo' scope or SSO not authorized."
-    else:
-        return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
+    return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
 
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     """Builds a leaderboard while tolerating header variations and skipping malformed sheets."""
@@ -220,7 +211,7 @@ gh_token = st.secrets.get("GITHUB_TOKEN", "")
 if not gh_token:
     gh_token = st.sidebar.text_input("GitHub token (repo scope)", type="password")
 
-# New: Test connection
+# Test button
 if st.sidebar.button("Test GitHub connection"):
     ok, msg = github_test(owner_repo, branch, gh_token)
     (st.sidebar.success if ok else st.sidebar.error)(msg)
@@ -527,7 +518,7 @@ with tabs[9]:
         if not owner_repo or not branch or not gh_token:
             st.error("Provide repo (owner/repo), branch, and GITHUB_TOKEN secret.")
         else:
-            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.8.1)")
+            status, text = github_put_file(owner_repo, "tracker.xlsx", branch, gh_token, updated_bytes, "Update tracker.xlsx from Admin app (v1.8.5)")
             if status in (200,201):
                 st.success("Published to GitHub. Player Home will update automatically.")
             else:
