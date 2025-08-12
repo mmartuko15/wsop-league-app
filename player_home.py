@@ -2,9 +2,8 @@
 import streamlit as st, pandas as pd, re, base64, requests
 from io import BytesIO
 
-import base64, requests, pandas as pd, re
+import pandas as pd, re, base64, requests
 from io import BytesIO
-from PIL import Image
 
 POINTS = {1:14,2:11,3:9,4:7,5:5,6:4,7:3,8:2,9:1,10:0.5}
 
@@ -21,114 +20,51 @@ def parse_money(x):
     except:
         return 0.0
 
-def pools_balance_robust(pools_df, pool_name):
-    if pools_df is None or pools_df.empty: return 0.0
-    df = pools_df.copy()
-    cols = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in df.columns}
-    type_col = cols.get("type")
-    pool_col = cols.get("pool")
-    amt_col  = cols.get("amount") or cols.get("amt") or cols.get("value")
-    if not (type_col and pool_col and amt_col):
-        return 0.0
-    df["_type"] = df[type_col].astype(str).str.strip().str.lower()
-    df["_pool"] = df[pool_col].astype(str).str.strip().str.lower()
-    df["_amt"]  = df[amt_col].apply(parse_money)
-    df["_sign"] = df["_type"].map({"accrual":1,"payout":-1}).fillna(1)
-    mask = df["_pool"]==pool_name.lower()
-    return float((df.loc[mask, "_amt"] * df.loc[mask, "_sign"]).sum())
-
-def read_tracker_bytes(file_bytes: bytes) -> dict:
-    return pd.read_excel(BytesIO(file_bytes), sheet_name=None, engine="openpyxl")
+def read_tracker_bytes(b: bytes):
+    return pd.read_excel(BytesIO(b), sheet_name=None, engine="openpyxl")
 
 def read_local_tracker():
     try:
         with open("tracker.xlsx","rb") as f:
             b = f.read()
-        return (read_tracker_bytes(b), b)
+        return read_tracker_bytes(b)
     except Exception:
-        return (None, None)
+        return None
 
-def github_get_file_sha(owner_repo: str, path: str, branch: str, token: str):
-    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}"} if token else {}
-    params = {"ref": branch}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    if r.status_code == 200:
-        return r.json().get("sha")
-    return None
-
-def github_put_file(owner_repo: str, path: str, branch: str, token: str, file_bytes: bytes, message: str):
-    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
-    headers = {"Authorization": f"token {token}"} if token else {}
-    content_b64 = base64.b64encode(file_bytes).decode("utf-8")
-    sha = github_get_file_sha(owner_repo, path, branch, token)
-    payload = {"message": message, "content": content_b64, "branch": branch}
-    if sha:
-        payload["sha"] = sha
-    r = requests.put(url, headers=headers, json=payload, timeout=30)
-    return r.status_code, r.text
-
-def github_test(owner_repo: str, branch: str, token: str):
-    if not owner_repo or "/" not in owner_repo:
-        return False, "Owner/Repo is blank or malformed. Expected 'owner/repo'."
-    if not branch:
-        return False, "Branch is blank."
-    r = requests.get(f"https://api.github.com/repos/{owner_repo}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
-    if r.status_code == 404:
-        return False, "Repository not found (check owner/repo spelling and that your token can see it)."
-    if r.status_code in (401,403):
-        return False, "Unauthorized. Token missing/invalid or lacks access (repo scope / SSO not authorized)."
-    r2 = requests.get(f"https://api.github.com/repos/{owner_repo}/branches/{branch}", headers={"Authorization": f"token {token}"} if token else {}, timeout=20)
-    if r2.status_code == 404:
-        return False, f"Branch '{branch}' not found."
-    if r2.status_code in (401,403):
-        return False, "Branch access denied. Token lacks permissions."
-    url = f"https://api.github.com/repos/{owner_repo}/contents/.wsop_write_test.txt"
-    payload = {"message":"write-test","content":base64.b64encode(b"wsop-write-test").decode("utf-8"),"branch":branch}
-    r3 = requests.put(url, headers={"Authorization": f"token {token}"} if token else {}, json=payload, timeout=20)
-    if r3.status_code in (200,201):
-        try:
-            sha = r3.json().get("content",{}).get("sha")
-            if sha:
-                requests.delete(url, headers={"Authorization": f"token {token}"} if token else {}, json={"message":"cleanup","sha":sha,"branch":branch}, timeout=20)
-        except Exception:
-            pass
-        return True, "Connection OK. Repo, branch, and write permission verified."
-    if r3.status_code == 404:
-        return False, "Write failed with 404. Repo/branch path not reachable with this token."
-    if r3.status_code == 401:
-        return False, "Unauthorized (401). Token missing or invalid."
-    if r3.status_code == 403:
-        return False, "Forbidden (403). Token lacks 'repo' scope or SSO not authorized."
-    return False, f"Write test failed: HTTP {r3.status_code}: {r3.text}"
+def pools_balance_robust(pools_df, pool_name):
+    if pools_df is None or isinstance(pools_df, dict) or pools_df is pd.NA:
+        return 0.0
+    if pools_df is None or pools_df.empty: return 0.0
+    df = pools_df.copy()
+    cols = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in df.columns}
+    tcol = cols.get("type"); pcol = cols.get("pool")
+    acol = cols.get("amount") or cols.get("amt") or cols.get("value")
+    if not (tcol and pcol and acol): return 0.0
+    tmp = pd.DataFrame({
+        "_type": df[tcol].astype(str).str.strip().str.lower(),
+        "_pool": df[pcol].astype(str).str.strip().str.lower(),
+        "_amt":  df[acol].apply(parse_money)
+    })
+    tmp["_sign"] = tmp["_type"].map({"accrual":1,"payout":-1}).fillna(1)
+    return float((tmp.loc[tmp["_pool"]==pool_name.lower(), "_amt"] * tmp.loc[tmp["_pool"]==pool_name.lower(), "_sign"]).sum())
 
 def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
-    def norm_cols(df):
-        mapping = {}
-        for c in df.columns:
-            key = re.sub(r'[^a-z0-9]', '', str(c).lower())
-            mapping[c] = key
-        return df.rename(columns=mapping)
-    def pick(colset, *candidates):
-        for cand in candidates:
-            if cand in colset:
-                return cand
-        return None
     frames = []
     for name, df in (sheet_map or {}).items():
         if not isinstance(df, pd.DataFrame): continue
         nm = str(name).lower()
         if not (nm.startswith("event_") and nm.endswith("_standings")): continue
         if df.empty: continue
-        df2 = norm_cols(df); colset = set(df2.columns)
-        player_key = pick(colset,"player","name")
-        place_key  = pick(colset,"place","rank","finish","position")
-        kos_key    = pick(colset,"kos","ko","knockouts","knockout","eliminations","elimination","elims","numeliminated","eliminated")
-        if not player_key or not place_key: continue
-        t = pd.DataFrame()
-        t["Player"] = df2[player_key].astype(str).str.strip()
-        t["Place"]  = pd.to_numeric(df2[place_key], errors="coerce")
-        t["KOs"]    = pd.to_numeric(df2[kos_key], errors="coerce").fillna(0).astype(int) if (kos_key and kos_key in df2.columns) else 0
+        key = {re.sub(r'[^a-z0-9]','', str(c).lower()): c for c in df.columns}
+        pcol = key.get("player") or key.get("name")
+        plcol = key.get("place") or key.get("rank") or key.get("finish") or key.get("position")
+        kcol  = key.get("kos") or key.get("knockouts") or key.get("eliminations") or key.get("elims") or key.get("numeliminated") or key.get("eliminated")
+        if not (pcol and plcol): continue
+        t = pd.DataFrame({
+            "Player": df[pcol].astype(str).str.strip(),
+            "Place": pd.to_numeric(df[plcol], errors="coerce")
+        })
+        t["KOs"] = pd.to_numeric(df[kcol], errors="coerce").fillna(0).astype(int) if kcol else 0
         t = t.dropna(subset=["Place"])
         t["Points"] = t["Place"].map(POINTS).fillna(0)
         frames.append(t)
@@ -144,69 +80,61 @@ def robust_leaderboard(sheet_map: dict) -> pd.DataFrame:
     g.index = g.index + 1
     return g
 
-def show_logo(st, primary="league_logo.jpg", fallback="league_logo.png"):
+def show_logo(st):
+    # Do not ship/overwrite user's logo; try to load if present.
     try:
-        st.image(primary, use_column_width=True)
+        st.image("league_logo.jpg", use_column_width=True)
     except Exception:
         try:
-            st.image(fallback, use_column_width=True)
+            st.image("league_logo.png", use_column_width=True)
         except Exception:
-            st.markdown("### WSOP League")
+            st.markdown("### League")
 
 
 st.set_page_config(page_title="WSOP League — Player Home", page_icon="🃏", layout="wide")
 
 col_logo, col_title = st.columns([1,4])
-with col_logo:
-    show_logo(st)
+with col_logo: show_logo(st)
 with col_title:
     st.markdown("### WSOP League — Player Home")
     st.caption("Countryside Country Club • Start 6:30 PM")
 
 st.divider()
 
-# Two sources: Repo file (bundled) or Upload override. Also a manual GitHub API fetch button.
-default_map, _ = read_local_tracker()
-mode = st.sidebar.radio("Load tracker from", ["Repo file (default)", "Upload file", "Fetch from GitHub (no cache)"], index=0)
+# Load tracker
+source_label = "Repo file (bundled)"
+sheet_map = read_local_tracker()
 
-sheet_map = None
-source_label = ""
+mode = st.sidebar.radio("Load tracker from", ["Repo file (default)","Upload file","Fetch from GitHub (no cache)"], index=0)
 
 if mode == "Upload file":
-    uploaded = st.sidebar.file_uploader("Upload tracker (.xlsx)", type=["xlsx"])
-    if uploaded:
-        sheet_map = read_tracker_bytes(uploaded.read())
+    up = st.sidebar.file_uploader("Upload tracker (.xlsx)", type=["xlsx"])
+    if up:
+        sheet_map = read_tracker_bytes(up.read())
         source_label = "Uploaded file"
 elif mode == "Fetch from GitHub (no cache)":
     owner_repo = st.sidebar.text_input("Owner/Repo", value="mmartuko15/wsop-league-app")
     branch = st.sidebar.text_input("Branch", value="main")
-    token = st.secrets.get("PLAYER_GITHUB_TOKEN", "")
-    if not token:
-        token = st.sidebar.text_input("GitHub token (read-only, optional for public repos)", type="password")
+    token = st.secrets.get("PLAYER_GITHUB_TOKEN","")
     if st.sidebar.button("Fetch via API now"):
         try:
             url = f"https://api.github.com/repos/{owner_repo}/contents/tracker.xlsx"
             headers = {"Authorization": f"token {token}"} if token else {}
-            params = {"ref": branch}
-            r = requests.get(url, headers=headers, params=params, timeout=20)
+            r = requests.get(url, headers=headers, params={"ref": branch}, timeout=20)
             r.raise_for_status()
-            content = base64.b64decode(r.json()["content"])
-            sheet_map = read_tracker_bytes(content)
+            content_b64 = r.json()["content"]
+            data = base64.b64decode(content_b64)
+            sheet_map = read_tracker_bytes(data)
             source_label = f"GitHub API — {owner_repo}@{branch}"
+            st.sidebar.success("Fetched latest tracker via API.")
         except Exception as e:
             st.sidebar.error(f"Fetch failed: {e}")
-else:
-    sheet_map = default_map
-    source_label = "Repo file (bundled)"
 
 if sheet_map is None:
-    st.info("No tracker loaded yet. Choose a data source in the sidebar.")
+    st.info("No tracker found. Add tracker.xlsx to repo or upload one.")
     st.stop()
 
-# Banner
-st.info(f"**Data source:** {source_label}")
-
-# KPI tiles
+# Pools / KPIs
 pools = sheet_map.get("Pools_Ledger", pd.DataFrame())
 wsop_total = pools_balance_robust(pools,"WSOP")
 bounty_total = pools_balance_robust(pools,"Bounty")
@@ -218,7 +146,11 @@ k1.metric("WSOP Pool", f"${wsop_total:,.2f}")
 k2.metric("Seat Value (each of 5)", f"${(wsop_total/5 if wsop_total else 0):,.2f}")
 k3.metric("Bounty Pool (live)", f"${bounty_total:,.2f}")
 k4.metric("High Hand (live)", f"${highhand_total:,.2f}")
+with k4:
+    st.markdown("[View details ↓](#high-hand-details)")
 k5.metric("Nightly Pool (post-payout)", f"${nightly_total:,.2f}")
+
+st.info(f"**Data source:** {source_label}")
 
 tabs = st.tabs(["Leaderboard","Events","Nightly Payouts","Bounties","High Hand","Second Chance","Player Finances","About"])
 
@@ -283,9 +215,33 @@ with tabs[3]:
     st.caption("Winner keeps their own $5 bounty; pool pays at final event.")
 
 with tabs[4]:
-    st.subheader("High Hand Jackpot (live)")
-    st.write(f"**Jackpot Value:** ${highhand_total:,.2f}")
-    st.caption("Updated from Pools Ledger. Holder/hand shared by host.")
+    st.markdown('<a name="high-hand-details"></a>', unsafe_allow_html=True)
+    st.subheader("High Hand")
+    hh = sheet_map.get("HighHand_Info", pd.DataFrame())
+    holder = hand_desc = override_val = last_upd = ""
+    if not hh.empty:
+        try:
+            holder = "" if pd.isna(hh.at[0,"Current Holder"]) else str(hh.at[0,"Current Holder"]).strip()
+            hand_desc = "" if pd.isna(hh.at[0,"Hand Description"]) else str(hh.at[0,"Hand Description"]).strip()
+            override_val = "" if pd.isna(hh.at[0,"Display Value (override)"]) else str(hh.at[0,"Display Value (override)"]).strip()
+            last_upd = "" if pd.isna(hh.at[0,"Last Updated"]) else str(hh.at[0,"Last Updated"]).strip()
+        except Exception:
+            pass
+    # Show details
+    st.write(f"**Current Holder:** {holder if holder else '—'}")
+    st.write(f"**Hand:** {hand_desc if hand_desc else '—'}")
+    # Amounts
+    def fmt_money(s):
+        try:
+            v = float(str(s).replace("$","").replace(",","").strip())
+            return f"${v:,.2f}"
+        except Exception:
+            return s if s else f"${highhand_total:,.2f}"
+    if override_val:
+        st.write(f"**Jackpot Value (override):** {fmt_money(override_val)}")
+    st.write(f"**Live Pool Total:** ${highhand_total:,.2f}")
+    if last_upd:
+        st.caption(f"Last Updated: {last_upd}")
 
 with tabs[5]:
     optins = sheet_map.get("SecondChance_OptIns", pd.DataFrame())
@@ -313,20 +269,21 @@ with tabs[6]:
             ev_frames.append(t)
         all_rows = pd.concat(ev_frames, ignore_index=True) if ev_frames else pd.DataFrame(columns=["Player","Payout_Amount","BountyEarned"])
         players_df = sheet_map.get("Players", pd.DataFrame(columns=["Player"]))
-        base = players_df[["Player"]].dropna().drop_duplicates().copy()
-        events_played = all_rows.groupby("Player").size().rename("Events Played").to_frame()
-        nightly_earned = all_rows.groupby("Player")["Payout_Amount"].sum().rename("Nightly Payouts Earned").to_frame()
-        bounties_earned = all_rows.groupby("Player")["BountyEarned"].sum().rename("Bounties Earned").to_frame()
-        buyins = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount"])).copy()
-        initial_buyins_paid = buyins.groupby("Player")["Amount"].sum().rename("Initial Buy-Ins Paid").to_frame() if not buyins.empty else pd.DataFrame(columns=["Initial Buy-Ins Paid"])
-        out = base.merge(events_played, left_on="Player", right_index=True, how="left")
-        out = out.merge(nightly_earned, left_on="Player", right_index=True, how="left")
-        out = out.merge(bounties_earned, left_on="Player", right_index=True, how="left")
+        base = players_df[["Player"]].dropna().drop_duplicates().copy() if not players_df.empty else pd.DataFrame(columns=["Player"])
+        out = base.merge(all_rows.groupby("Player").size().rename("Events Played"), left_on="Player", right_index=True, how="left")
+        out = out.merge(all_rows.groupby("Player")["Payout_Amount"].sum().rename("Nightly Payouts Earned"), left_on="Player", right_index=True, how="left")
+        out = out.merge(all_rows.groupby("Player")["BountyEarned"].sum().rename("Bounties Earned"), left_on="Player", right_index=True, how="left")
         out["Events Played"] = out["Events Played"].fillna(0).astype(int)
         out["Nightly Fees Paid"] = out["Events Played"] * 55.0
         out["Bounty Contributions Paid"] = out["Events Played"] * 5.0
-        out = out.merge(initial_buyins_paid, left_on="Player", right_index=True, how="left")
+        buyins = sheet_map.get("Series_BuyIns", pd.DataFrame(columns=["Player","Amount"])).copy()
+        if not buyins.empty:
+            initial_buyins_paid = buyins.groupby("Player")["Amount"].sum().rename("Initial Buy-Ins Paid").to_frame()
+            out = out.merge(initial_buyins_paid, left_on="Player", right_index=True, how="left")
+        else:
+            out["Initial Buy-Ins Paid"] = 0.0
         for col in ["Nightly Payouts Earned","Bounties Earned","Initial Buy-Ins Paid"]:
+            if col not in out.columns: out[col]=0.0
             out[col] = out[col].fillna(0.0)
         out["Total Paid In"] = out["Initial Buy-Ins Paid"] + out["Nightly Fees Paid"]
         out["Total Earned"] = out["Nightly Payouts Earned"] + out["Bounties Earned"]
